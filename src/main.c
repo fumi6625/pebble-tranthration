@@ -8,8 +8,8 @@
 #define LOG_MAX              10
 
 typedef struct {
-  char original[150];   // Japanese original (up to ~50 chars UTF-8)
-  char translated[201]; // Translated result
+  char original[150];
+  char translated[201];
 } LogEntry;
 
 // ── Main window state ──────────────────────────────────────────────────────
@@ -34,7 +34,6 @@ static void start_dictation(void);
 
 // ── Log management ─────────────────────────────────────────────────────────
 static void add_to_log(const char *original, const char *translated) {
-  // Shift existing entries so [0] is always the newest
   int n = (s_log_count < LOG_MAX) ? s_log_count : LOG_MAX - 1;
   memmove(&s_log[1], &s_log[0], n * sizeof(LogEntry));
   if (s_log_count < LOG_MAX) { s_log_count++; }
@@ -57,7 +56,6 @@ static void log_draw_row(GContext *ctx, const Layer *cell,
     menu_cell_basic_draw(ctx, cell, "No history yet", NULL, NULL);
     return;
   }
-  // Title: translated text  Subtitle: original Japanese (kana renders; kanji may not)
   menu_cell_basic_draw(ctx, cell,
                        s_log[idx->row].translated,
                        s_log[idx->row].original,
@@ -75,7 +73,6 @@ static void log_window_appear(Window *window) {
 static void log_window_load(Window *window) {
   Layer *root = window_get_root_layer(window);
   GRect bounds = layer_get_bounds(root);
-
   s_log_menu = menu_layer_create(bounds);
   menu_layer_set_callbacks(s_log_menu, NULL, (MenuLayerCallbacks){
     .get_num_rows    = log_get_num_rows,
@@ -132,16 +129,21 @@ static void dictation_session_callback(DictationSession *session,
 }
 
 // ── AppMessage ─────────────────────────────────────────────────────────────
-static void send_translation_request(const char *lang) {
+static void send_translation_request(void) {
   cancel_watchdog();
+
+  // Truncate Japanese text to fit AppMessage buffer (3 bytes/char for UTF-8)
+  char safe_text[300];
+  snprintf(safe_text, sizeof(safe_text), "%s", s_dictated_text);
+
   DictionaryIterator *iter;
   AppMessageResult result = app_message_outbox_begin(&iter);
   if (result != APP_MSG_OK) {
     text_layer_set_text(s_status_layer, "Outbox error");
     return;
   }
-  dict_write_cstring(iter, KEY_TEXT, s_dictated_text);
-  dict_write_cstring(iter, KEY_LANG, lang);
+  dict_write_cstring(iter, KEY_TEXT, safe_text);
+  dict_write_cstring(iter, KEY_LANG, "en");
   result = app_message_outbox_send();
   if (result != APP_MSG_OK) {
     text_layer_set_text(s_status_layer, "Send error");
@@ -157,9 +159,10 @@ static void inbox_received_callback(DictionaryIterator *iter, void *context) {
 
   const char *result = t->value->cstring;
 
-  // ZH confirmation sentinel — notification was shown on watch, nothing to log
-  if (strncmp(result, "[ZH", 3) == 0) {
-    text_layer_set_text(s_status_layer, "UP=EN SEL=Mic DN=Log");
+  // "JS OK" is the startup diagnostic sent by the JS ready event.
+  // It confirms that JS is loaded and the JS→watch message path works.
+  if (strncmp(result, "JS OK", 5) == 0) {
+    text_layer_set_text(s_status_layer, "JS OK! SEL=record");
     return;
   }
 
@@ -187,9 +190,9 @@ static void outbox_sent_callback(DictionaryIterator *iter, void *context) {
 // ── Button handlers ────────────────────────────────────────────────────────
 static void up_click_handler(ClickRecognizerRef recognizer, void *context) {
   if (s_dictated_text[0] != '\0') {
-    text_layer_set_text(s_status_layer, "Translating EN...");
+    text_layer_set_text(s_status_layer, "Translating...");
     text_layer_set_text(s_main_layer, "");
-    send_translation_request("en");
+    send_translation_request();
   }
 }
 
@@ -205,20 +208,10 @@ static void down_click_handler(ClickRecognizerRef recognizer, void *context) {
   open_log();
 }
 
-// Long-press DOWN: translate to Chinese (less frequent, kept as secondary action)
-static void down_long_click_handler(ClickRecognizerRef recognizer, void *context) {
-  if (s_dictated_text[0] != '\0') {
-    text_layer_set_text(s_status_layer, "Translating ZH...");
-    text_layer_set_text(s_main_layer, "");
-    send_translation_request("zh");
-  }
-}
-
 static void click_config_provider(void *context) {
   window_single_click_subscribe(BUTTON_ID_UP,     up_click_handler);
   window_single_click_subscribe(BUTTON_ID_SELECT, select_click_handler);
   window_single_click_subscribe(BUTTON_ID_DOWN,   down_click_handler);
-  window_long_click_subscribe(BUTTON_ID_DOWN, 700, down_long_click_handler, NULL);
 }
 
 // ── Dictation start ────────────────────────────────────────────────────────
