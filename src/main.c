@@ -43,7 +43,6 @@ static TextLayer *s_clock_layer = NULL;
 // ── Log window ────────────────────────────────────────────────────────────
 static Window    *s_log_window = NULL;
 static Layer     *s_log_canvas = NULL;
-static int        s_log_scroll = 0;
 
 // ── Forward declarations ──────────────────────────────────────────────────
 static void start_dictation(void);
@@ -293,7 +292,7 @@ static void log_canvas_draw(Layer *layer, GContext *ctx) {
   graphics_context_set_text_color(ctx, GColorWhite);
 #endif
   // "LOG  直近10件" header
-  graphics_draw_text(ctx, "LOG  \xe7\x9b\xb4\xe8\xbf\x9110\xe4\xbb\xb6",
+  graphics_draw_text(ctx, "LOG  \xe7\x9b\xb4\xe8\xbf\x91" "10\xe4\xbb\xb6",
                      fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
                      GRect(4, 2, bounds.size.w - 8, 22),
                      GTextOverflowModeFill, GTextAlignmentLeft, NULL);
