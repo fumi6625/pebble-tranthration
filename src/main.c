@@ -16,20 +16,15 @@ typedef struct {
   char timestamp[8];
 } LogEntry;
 
-// ── State ─────────────────────────────────────────────────────────────────
 static AppState          s_state = STATE_HOME;
 static char              s_dictated_text[512];
 static char              s_translated_text[512];
 static char              s_clock_text[8];
 static LogEntry          s_log[LOG_MAX];
 static int               s_log_count = 0;
-
-// ── Timers ────────────────────────────────────────────────────────────────
 static AppTimer         *s_watchdog   = NULL;
 static AppTimer         *s_wave_timer = NULL;
 static int               s_wave_phase = 0;
-
-// ── Windows / Layers ──────────────────────────────────────────────────────
 static Window           *s_window      = NULL;
 static Layer            *s_canvas      = NULL;
 static TextLayer        *s_clock_layer = NULL;
@@ -38,39 +33,59 @@ static Layer            *s_log_canvas  = NULL;
 static DictationSession *s_dictation   = NULL;
 
 // ── Face GPath ────────────────────────────────────────────────────────────
-// Approximated from SVG: M70 22 C90 26 98 44 97 61 C96 78 88 92 70 98
+// SVG path (viewBox 0 0 120 120, strokeWidth 7, facing left):
+//   M70 22 C90 26 98 44 97 61 C96 78 88 92 70 98
 //   C58 101 48 100 43 93 L40 84 L47 73 L32 62 L47 53
-//   C49 45 47 37 53 31 C58 25 63 22 70 22 Z  (viewBox 0 0 120 120)
-// Scale 0.60, offset (+23, +35) → face center ≈ (62, 72), h≈46px
-static GPoint s_face_points[] = {
-  {65, 48}, {72, 51}, {76, 55}, {79, 60}, {81, 66},
-  {81, 72}, {81, 78}, {78, 83}, {75, 87}, {71, 91},
-  {65, 94}, {55, 94}, {49, 91},
-  {47, 85}, {51, 79}, {42, 72}, {51, 67},
-  {52, 60}, {55, 54}, {60, 49}, {65, 48},
+//   C49 45 47 37 53 31 C58 25 63 22 70 22 Z
+// Bezier curves sampled at t=0,0.2,0.4,0.6,0.8,1.0
+// Scale 0.84, offset (+18, +37) → face 55px wide, 65px tall
+// Center on Pebble: x≈72, y≈87
+static GPoint s_face_pts[] = {
+  {77, 55},  // M70,22  — top of head
+  {86, 59},  // C1 t=0.2  (≈81,26)
+  {92, 65},  // C1 t=0.4  (≈88,33)
+  {97, 71},  // C1 t=0.6  (≈94,41)
+  {99, 80},  // C1 t=0.8  (≈96,51)
+  {99, 88},  // C1 t=1.0  (97,61)  — rightmost, back of head
+  {99, 97},  // C2 t=0.2  (≈96,71)
+  {95, 104}, // C2 t=0.4  (≈92,80)
+  {91, 110}, // C2 t=0.6  (≈87,87)
+  {85, 115}, // C2 t=0.8  (≈80,93)
+  {77, 119}, // C2 t=1.0  (70,98)  — bottom right
+  {63, 120}, // C3 t=0.5  (≈54,99) — chin bottom
+  {54, 115}, // C3 t=1.0  (43,93)  — chin left
+  {52, 108}, // L40,84   — jaw indentation
+  {57, 98},  // L47,73
+  {45, 89},  // L32,62   — mouth indent, leftmost point
+  {57, 82},  // L47,53
+  {59, 71},  // C4 t=0.5  (≈49,41)
+  {63, 63},  // C4 t=1.0  (53,31)  — upper back
+  {69, 57},  // C5 t=0.5  (≈61,24)
+              // path auto-closes to {77,55}
 };
-static const GPathInfo s_face_path_info = {
-  .num_points = 21,
-  .points = s_face_points,
+static const GPathInfo s_face_info = {
+  .num_points = 20,
+  .points     = s_face_pts,
 };
 static GPath *s_face_path = NULL;
 
-// ── Forward declarations ──────────────────────────────────────────────────
+// Eye:   SVG (62,48) → Pebble (70, 77),  r≈3
+// Mouth: SVG (42,78) → Pebble (53,103), outer r=6 yellow, inner r=4 blue
+// sw1:   SVG M22,78 L15,78  → Pebble (36,103)-(31,103)
+// sw2:   SVG M18,70 Q9,75 9,86 → (33,96)-(27,101)-(26,109)
+// sw3:   SVG M15,62 Q4,71 5,93 → (31,89)-(24,99)-(22,115)
+
 static void start_dictation(void);
 static void send_translation_request(void);
 
-// ── Helpers ───────────────────────────────────────────────────────────────
 static void cancel_watchdog(void) {
   if (s_watchdog) { app_timer_cancel(s_watchdog); s_watchdog = NULL; }
 }
 static void stop_wave(void) {
   if (s_wave_timer) { app_timer_cancel(s_wave_timer); s_wave_timer = NULL; }
 }
-static void canvas_mark_dirty(void) {
-  if (s_canvas) { layer_mark_dirty(s_canvas); }
-}
+static void canvas_dirty(void) { if (s_canvas) layer_mark_dirty(s_canvas); }
 
-// ── Log ───────────────────────────────────────────────────────────────────
 static void add_to_log(const char *orig, const char *trans) {
   int n = (s_log_count < LOG_MAX) ? s_log_count : LOG_MAX - 1;
   memmove(&s_log[1], &s_log[0], n * sizeof(LogEntry));
@@ -83,28 +98,77 @@ static void add_to_log(const char *orig, const char *trans) {
            "%02d:%02d", t->tm_hour, t->tm_min);
 }
 
-// ── Clock ─────────────────────────────────────────────────────────────────
 static void tick_handler(struct tm *tick_time, TimeUnits units_changed) {
   snprintf(s_clock_text, sizeof(s_clock_text),
            "%02d:%02d", tick_time->tm_hour, tick_time->tm_min);
   if (s_clock_layer) text_layer_set_text(s_clock_layer, s_clock_text);
 }
 
-// ── Wave animation ────────────────────────────────────────────────────────
-static void wave_timer_callback(void *ctx) {
+static void wave_timer_cb(void *ctx) {
   s_wave_phase = (s_wave_phase + 1) % 4;
-  canvas_mark_dirty();
+  canvas_dirty();
   s_wave_timer = (s_state == STATE_LISTENING)
-    ? app_timer_register(WAVE_TIMER_MS, wave_timer_callback, NULL)
-    : NULL;
+    ? app_timer_register(WAVE_TIMER_MS, wave_timer_cb, NULL) : NULL;
 }
 static void start_wave(void) {
   stop_wave();
   s_wave_phase = 0;
-  s_wave_timer = app_timer_register(WAVE_TIMER_MS, wave_timer_callback, NULL);
+  s_wave_timer = app_timer_register(WAVE_TIMER_MS, wave_timer_cb, NULL);
 }
 
-// ── Canvas draw ───────────────────────────────────────────────────────────
+// ── Draw face (outline + eye + mouth + sound waves) ───────────────────────
+static void draw_face(GContext *ctx) {
+  if (!s_face_path) return;
+
+#ifdef PBL_COLOR
+  graphics_context_set_stroke_color(ctx, GColorYellow);
+  graphics_context_set_fill_color(ctx,   GColorYellow);
+#else
+  graphics_context_set_stroke_color(ctx, GColorBlack);
+  graphics_context_set_fill_color(ctx,   GColorBlack);
+#endif
+
+  // Draw outline 4× offset for ~2px stroke weight
+  int ox, oy;
+  for (ox = 0; ox <= 1; ox++) {
+    for (oy = 0; oy <= 1; oy++) {
+      gpath_move_to(s_face_path, GPoint(ox, oy));
+      gpath_draw_outline(ctx, s_face_path);
+    }
+  }
+  gpath_move_to(s_face_path, GPoint(0, 0));
+
+  // Eye: filled circle
+  graphics_fill_circle(ctx, GPoint(70, 77), 3);
+
+  // Mouth: yellow outer then blue inner
+  graphics_fill_circle(ctx, GPoint(53, 103), 6);
+#ifdef PBL_COLOR
+  graphics_context_set_fill_color(ctx, GColorFromRGB(0, 85, 170));
+#else
+  graphics_context_set_fill_color(ctx, GColorWhite);
+#endif
+  graphics_fill_circle(ctx, GPoint(53, 103), 3);
+
+  // Sound waves (visible when listening)
+  if (s_state != STATE_LISTENING) return;
+#ifdef PBL_COLOR
+  graphics_context_set_stroke_color(ctx, GColorYellow);
+  graphics_context_set_fill_color(ctx,   GColorYellow);
+#else
+  graphics_context_set_stroke_color(ctx, GColorBlack);
+#endif
+  // sw1: horizontal line at mouth level
+  graphics_draw_line(ctx, GPoint(36, 103), GPoint(31, 103));
+  // sw2: arc curving down-left (Q9,75 9,86 in SVG)
+  graphics_draw_line(ctx, GPoint(33, 96), GPoint(27, 101));
+  graphics_draw_line(ctx, GPoint(27, 101), GPoint(26, 109));
+  // sw3: wider arc (Q4,71 5,93 in SVG)
+  graphics_draw_line(ctx, GPoint(31, 89), GPoint(24, 99));
+  graphics_draw_line(ctx, GPoint(24, 99), GPoint(22, 115));
+}
+
+// ── Main canvas ───────────────────────────────────────────────────────────
 static void canvas_draw(Layer *layer, GContext *ctx) {
   GRect b = layer_get_bounds(layer);
 
@@ -116,113 +180,71 @@ static void canvas_draw(Layer *layer, GContext *ctx) {
 #endif
   graphics_fill_rect(ctx, b, 0, GCornerNone);
 
-  // ── Face outline (yellow on color, black on B&W) ──────────────────────
-#ifdef PBL_COLOR
-  graphics_context_set_stroke_color(ctx, GColorYellow);
-  graphics_context_set_fill_color(ctx,   GColorYellow);
-#else
-  graphics_context_set_stroke_color(ctx, GColorBlack);
-  graphics_context_set_fill_color(ctx,   GColorBlack);
-#endif
-  if (s_face_path) {
-    gpath_move_to(s_face_path, GPoint(0, 0));
-    gpath_draw_outline(ctx, s_face_path);
-    gpath_move_to(s_face_path, GPoint(1, 0));
-    gpath_draw_outline(ctx, s_face_path);
-    gpath_move_to(s_face_path, GPoint(0, 1));
-    gpath_draw_outline(ctx, s_face_path);
-  }
+  // Face
+  draw_face(ctx);
 
-  // Eye at SVG (62,48) → Pebble (60, 64)
-  graphics_fill_circle(ctx, GPoint(60, 64), 3);
-
-  // Mouth at SVG (42,78) → Pebble (48, 82) — filled ellipse approx
-  graphics_fill_circle(ctx, GPoint(48, 82), 4);
-#ifdef PBL_COLOR
-  // Dark blue fill inside to give "open mouth" effect
-  graphics_context_set_fill_color(ctx, GColorFromRGB(0, 85, 170));
-  graphics_fill_circle(ctx, GPoint(48, 82), 2);
-#endif
-
-  // Sound waves when listening (3 lines to the left of mouth)
-  if (s_state == STATE_LISTENING) {
-#ifdef PBL_COLOR
-    graphics_context_set_stroke_color(ctx, GColorYellow);
-#else
-    graphics_context_set_stroke_color(ctx, GColorBlack);
-#endif
-    // sw1: short horizontal line at mouth level
-    graphics_draw_line(ctx, GPoint(39, 82), GPoint(34, 82));
-    // sw2: slight arc downward (2 segments)
-    graphics_draw_line(ctx, GPoint(35, 77), GPoint(31, 81));
-    graphics_draw_line(ctx, GPoint(31, 81), GPoint(30, 88));
-    // sw3: longer arc (2 segments)
-    graphics_draw_line(ctx, GPoint(32, 72), GPoint(26, 78));
-    graphics_draw_line(ctx, GPoint(26, 78), GPoint(25, 94));
-  }
-
-  // ── "JP→EN" title, centered ───────────────────────────────────────────
-  // Arrow U+2192 = \xe2\x86\x92
+  // ── "JP→EN" title (centered, below clock) ────────────────────────────
+  // U+2192 → = \xe2\x86\x92
 #ifdef PBL_COLOR
   graphics_context_set_text_color(ctx, GColorWhite);
 #else
   graphics_context_set_text_color(ctx, GColorBlack);
 #endif
-  graphics_draw_text(ctx, "JP\xe2\x86\x92" "EN",
-                     fonts_get_system_font(FONT_KEY_GOTHIC_28_BOLD),
-                     GRect(0, 14, b.size.w - 16, 32),
+  graphics_draw_text(ctx, "JP \xe2\x86\x92 EN",
+                     fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD),
+                     GRect(0, 17, b.size.w - 16, 30),
                      GTextOverflowModeFill, GTextAlignmentCenter, NULL);
 
-  // ── Prompt / result / listening label ─────────────────────────────────
-#ifdef PBL_COLOR
-  graphics_context_set_text_color(ctx, GColorWhite);
-#else
-  graphics_context_set_text_color(ctx, GColorBlack);
-#endif
+  // ── Prompt / listening label ──────────────────────────────────────────
   if (s_state == STATE_LISTENING) {
     // "聞き取り中…"
     graphics_draw_text(ctx,
-      "\xe8\x81\x9e\xe3\x81\x8d\xe5\x8f\x96\xe3\x82\x8a\xe4\xb8\xad"
-      "\xe2\x80\xa6",
+      "\xe8\x81\x9e\xe3\x81\x8d\xe5\x8f\x96\xe3\x82\x8a"
+      "\xe4\xb8\xad\xe2\x80\xa6",
       fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
-      GRect(4, 100, b.size.w - 22, 24),
+      GRect(4, 124, b.size.w - 22, 24),
       GTextOverflowModeFill, GTextAlignmentCenter, NULL);
 
-    // Wave bars (13 bars)
+    // Wave bars (13 bars, animated)
     static const int8_t wh[4][13] = {
       { 5, 8,12,16,20,22,20,16,12, 8, 5, 4, 3},
       { 3, 5, 8,14,20,22,20,14, 8, 5, 3, 5, 8},
       { 5, 9,14,18,20,18,14, 9, 5, 4, 6,10,14},
       { 4, 7,12,18,22,20,16,12, 7, 5, 8,12,16},
     };
-    int x0 = (b.size.w - 13 * 7 + 3) / 2;
+    int x0 = (b.size.w - 88) / 2;  // 13*(4+3)-3=88
+#ifdef PBL_COLOR
+    graphics_context_set_fill_color(ctx, GColorWhite);
+#else
+    graphics_context_set_fill_color(ctx, GColorBlack);
+#endif
     for (int i = 0; i < 13; i++) {
       int h = wh[s_wave_phase][i];
-#ifdef PBL_COLOR
-      graphics_context_set_fill_color(ctx, GColorWhite);
-#else
-      graphics_context_set_fill_color(ctx, GColorBlack);
-#endif
       graphics_fill_rect(ctx,
-        GRect(x0 + i * 7, b.size.h - 16 - h, 4, h),
-        1, GCornersAll);
+        GRect(x0 + i * 7, b.size.h - 18 - h, 4, h), 1, GCornersAll);
     }
   } else {
+    // HOME: "日本語で話しかけてください。"
+    // RESULT: show translated text
     const char *body = (s_state == STATE_RESULT && s_translated_text[0])
       ? s_translated_text
-      // "日本語で話しかけてください。"
       : "\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e\xe3\x81\xa7"
         "\xe8\xa9\xb1\xe3\x81\x97\xe3\x81\x8b\xe3\x81\x91"
         "\xe3\x81\xa6\xe3\x81\x8f\xe3\x81\xa0\xe3\x81\x95"
         "\xe3\x81\x84\xe3\x80\x82";
+#ifdef PBL_COLOR
+    graphics_context_set_text_color(ctx, GColorWhite);
+#else
+    graphics_context_set_text_color(ctx, GColorBlack);
+#endif
     graphics_draw_text(ctx, body,
       fonts_get_system_font(FONT_KEY_GOTHIC_14),
-      GRect(4, 100, b.size.w - 22, 62),
+      GRect(4, 124, b.size.w - 22, 40),
       GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
   }
 
   // ── Right-edge labels ─────────────────────────────────────────────────
-  // REC (red) / STOP (white) at middle button height
+  // REC (red) at middle button / STOP when listening
 #ifdef PBL_COLOR
   graphics_context_set_text_color(ctx,
     (s_state == STATE_LISTENING) ? GColorWhite : GColorRed);
@@ -232,10 +254,10 @@ static void canvas_draw(Layer *layer, GContext *ctx) {
   graphics_draw_text(ctx,
     (s_state == STATE_LISTENING) ? "STP" : "REC",
     fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD),
-    GRect(b.size.w - 24, b.size.h / 2 - 9, 23, 16),
+    GRect(b.size.w - 24, b.size.h / 2 - 8, 23, 16),
     GTextOverflowModeFill, GTextAlignmentRight, NULL);
 
-  // LOG (dark) at down button height
+  // LOG at down-button level
 #ifdef PBL_COLOR
   graphics_context_set_text_color(ctx, GColorBlack);
 #else
@@ -243,15 +265,14 @@ static void canvas_draw(Layer *layer, GContext *ctx) {
 #endif
   graphics_draw_text(ctx, "LOG",
     fonts_get_system_font(FONT_KEY_GOTHIC_14),
-    GRect(b.size.w - 24, b.size.h - 32, 23, 16),
+    GRect(b.size.w - 24, b.size.h - 34, 23, 16),
     GTextOverflowModeFill, GTextAlignmentRight, NULL);
 }
 
-// ── Log canvas draw ───────────────────────────────────────────────────────
+// ── Log canvas ────────────────────────────────────────────────────────────
 static void log_canvas_draw(Layer *layer, GContext *ctx) {
   GRect b = layer_get_bounds(layer);
 
-  // Same sky-blue background as home
 #ifdef PBL_COLOR
   graphics_context_set_fill_color(ctx, GColorFromRGB(85, 170, 255));
 #else
@@ -259,7 +280,7 @@ static void log_canvas_draw(Layer *layer, GContext *ctx) {
 #endif
   graphics_fill_rect(ctx, b, 0, GCornerNone);
 
-  // Header bar (dark blue)
+  // Header bar
 #ifdef PBL_COLOR
   graphics_context_set_fill_color(ctx, GColorFromRGB(0, 85, 170));
 #else
@@ -274,9 +295,9 @@ static void log_canvas_draw(Layer *layer, GContext *ctx) {
 #endif
   graphics_draw_text(ctx, "LOG",
     fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
-    GRect(8, 4, 48, 20), GTextOverflowModeFill, GTextAlignmentLeft, NULL);
+    GRect(8, 3, 50, 22), GTextOverflowModeFill, GTextAlignmentLeft, NULL);
 
-  // "直近10件" — split at \x91 to avoid hex-continuation error
+  // "直近10件" (split at \x91 to avoid hex-continuation)
 #ifdef PBL_COLOR
   graphics_context_set_text_color(ctx, GColorFromRGB(170, 220, 255));
 #else
@@ -303,9 +324,8 @@ static void log_canvas_draw(Layer *layer, GContext *ctx) {
 
   int y = 32;
   for (int i = 0; i < s_log_count && y < b.size.h - 4; i++) {
-    // Card
 #ifdef PBL_COLOR
-    graphics_context_set_fill_color(ctx, GColorFromRGB(255, 255, 255));
+    graphics_context_set_fill_color(ctx, GColorWhite);
     graphics_context_set_stroke_color(ctx, GColorFromRGB(170, 200, 255));
 #else
     graphics_context_set_fill_color(ctx, GColorWhite);
@@ -313,7 +333,6 @@ static void log_canvas_draw(Layer *layer, GContext *ctx) {
 #endif
     graphics_fill_rect(ctx, GRect(6, y, b.size.w - 12, 52), 4, GCornersAll);
 
-    // Timestamp
 #ifdef PBL_COLOR
     graphics_context_set_text_color(ctx, GColorFromRGB(0, 85, 170));
 #else
@@ -321,21 +340,14 @@ static void log_canvas_draw(Layer *layer, GContext *ctx) {
 #endif
     graphics_draw_text(ctx, s_log[i].timestamp,
       fonts_get_system_font(FONT_KEY_GOTHIC_14),
-      GRect(10, y + 2, 44, 14),
-      GTextOverflowModeFill, GTextAlignmentLeft, NULL);
+      GRect(10, y + 2, 44, 14), GTextOverflowModeFill, GTextAlignmentLeft, NULL);
 
-    // Japanese original
-#ifdef PBL_COLOR
     graphics_context_set_text_color(ctx, GColorBlack);
-#else
-    graphics_context_set_text_color(ctx, GColorBlack);
-#endif
     graphics_draw_text(ctx, s_log[i].original,
       fonts_get_system_font(FONT_KEY_GOTHIC_14),
       GRect(10, y + 16, b.size.w - 20, 14),
       GTextOverflowModeFill, GTextAlignmentLeft, NULL);
 
-    // English translation (yellow on color)
 #ifdef PBL_COLOR
     graphics_context_set_text_color(ctx, GColorYellow);
 #else
@@ -351,26 +363,26 @@ static void log_canvas_draw(Layer *layer, GContext *ctx) {
 }
 
 // ── Watchdog ──────────────────────────────────────────────────────────────
-static void watchdog_callback(void *context) {
+static void watchdog_cb(void *ctx) {
   s_watchdog = NULL;
   stop_wave();
   s_state = STATE_HOME;
-  canvas_mark_dirty();
+  canvas_dirty();
 }
 
 // ── Dictation ─────────────────────────────────────────────────────────────
-static void dictation_session_callback(DictationSession *session,
-                                       DictationSessionStatus status,
-                                       char *transcription, void *context) {
+static void dictation_cb(DictationSession *session,
+                         DictationSessionStatus status,
+                         char *transcription, void *context) {
   stop_wave();
   if (status == DictationSessionStatusSuccess) {
     snprintf(s_dictated_text, sizeof(s_dictated_text), "%s", transcription);
     s_state = STATE_HOME;
-    canvas_mark_dirty();
+    canvas_dirty();
     send_translation_request();
   } else {
     s_state = STATE_HOME;
-    canvas_mark_dirty();
+    canvas_dirty();
   }
 }
 
@@ -384,86 +396,75 @@ static void send_translation_request(void) {
   dict_write_cstring(iter, KEY_TEXT, safe);
   dict_write_cstring(iter, KEY_LANG, "en");
   if (app_message_outbox_send() != APP_MSG_OK) return;
-  s_watchdog = app_timer_register(TRANSLATE_TIMEOUT_MS, watchdog_callback, NULL);
+  s_watchdog = app_timer_register(TRANSLATE_TIMEOUT_MS, watchdog_cb, NULL);
 }
 
-static void inbox_received_callback(DictionaryIterator *iter, void *context) {
+static void inbox_received(DictionaryIterator *iter, void *ctx) {
   cancel_watchdog();
   Tuple *t = dict_find(iter, KEY_RESULT);
   if (!t) return;
-  const char *result = t->value->cstring;
-  if (strncmp(result, "JS OK", 5) == 0) return;
-  snprintf(s_translated_text, sizeof(s_translated_text), "%s", result);
+  const char *r = t->value->cstring;
+  if (strncmp(r, "JS OK", 5) == 0) return;
+  snprintf(s_translated_text, sizeof(s_translated_text), "%s", r);
   add_to_log(s_dictated_text, s_translated_text);
   s_state = STATE_RESULT;
-  canvas_mark_dirty();
+  canvas_dirty();
 }
-
-static void inbox_dropped_callback(AppMessageResult reason, void *context) {
-  cancel_watchdog();
-}
-static void outbox_failed_callback(DictionaryIterator *iter,
-                                   AppMessageResult reason, void *context) {
-  cancel_watchdog();
-}
-static void outbox_sent_callback(DictionaryIterator *iter, void *context) {}
+static void inbox_dropped(AppMessageResult reason, void *ctx) { cancel_watchdog(); }
+static void outbox_failed(DictionaryIterator *iter, AppMessageResult reason, void *ctx) { cancel_watchdog(); }
+static void outbox_sent(DictionaryIterator *iter, void *ctx) {}
 
 // ── Buttons ───────────────────────────────────────────────────────────────
-static void up_click_handler(ClickRecognizerRef r, void *ctx) {
+static void btn_up(ClickRecognizerRef r, void *ctx) {
   if (s_dictated_text[0] && s_state != STATE_LISTENING)
     send_translation_request();
 }
-static void select_click_handler(ClickRecognizerRef r, void *ctx) {
+static void btn_select(ClickRecognizerRef r, void *ctx) {
   if (s_state == STATE_LISTENING) {
     dictation_session_stop(s_dictation);
     stop_wave();
     s_state = STATE_HOME;
-    canvas_mark_dirty();
+    canvas_dirty();
   } else {
     start_dictation();
   }
 }
-static void down_click_handler(ClickRecognizerRef r, void *ctx) {
+static void btn_down(ClickRecognizerRef r, void *ctx) {
   if (s_log_window) window_stack_push(s_log_window, true);
 }
-static void click_config_provider(void *ctx) {
-  window_single_click_subscribe(BUTTON_ID_UP,     up_click_handler);
-  window_single_click_subscribe(BUTTON_ID_SELECT, select_click_handler);
-  window_single_click_subscribe(BUTTON_ID_DOWN,   down_click_handler);
+static void click_provider(void *ctx) {
+  window_single_click_subscribe(BUTTON_ID_UP,     btn_up);
+  window_single_click_subscribe(BUTTON_ID_SELECT, btn_select);
+  window_single_click_subscribe(BUTTON_ID_DOWN,   btn_down);
 }
 
-// ── Dictation start ───────────────────────────────────────────────────────
 static void start_dictation(void) {
   if (!s_dictation) return;
   s_state = STATE_LISTENING;
-  canvas_mark_dirty();
+  canvas_dirty();
   start_wave();
   dictation_session_start(s_dictation);
 }
 
 // ── Log window ────────────────────────────────────────────────────────────
-static void log_window_load(Window *w) {
+static void log_load(Window *w) {
   Layer *root = window_get_root_layer(w);
   s_log_canvas = layer_create(layer_get_bounds(root));
   layer_set_update_proc(s_log_canvas, log_canvas_draw);
   layer_add_child(root, s_log_canvas);
 }
-static void log_window_appear(Window *w) {
-  if (s_log_canvas) layer_mark_dirty(s_log_canvas);
-}
-static void log_window_unload(Window *w) {
+static void log_appear(Window *w) { if (s_log_canvas) layer_mark_dirty(s_log_canvas); }
+static void log_unload(Window *w) {
   if (s_log_canvas) { layer_destroy(s_log_canvas); s_log_canvas = NULL; }
 }
-static void log_back_click(ClickRecognizerRef r, void *ctx) {
-  window_stack_pop(true);
-}
-static void log_click_config(void *ctx) {
-  window_single_click_subscribe(BUTTON_ID_SELECT, log_back_click);
-  window_single_click_subscribe(BUTTON_ID_BACK,   log_back_click);
+static void log_back(ClickRecognizerRef r, void *ctx) { window_stack_pop(true); }
+static void log_clicks(void *ctx) {
+  window_single_click_subscribe(BUTTON_ID_SELECT, log_back);
+  window_single_click_subscribe(BUTTON_ID_BACK,   log_back);
 }
 
 // ── Main window ───────────────────────────────────────────────────────────
-static void window_load(Window *w) {
+static void main_load(Window *w) {
   Layer *root = window_get_root_layer(w);
   GRect bounds = layer_get_bounds(root);
 
@@ -471,7 +472,6 @@ static void window_load(Window *w) {
   layer_set_update_proc(s_canvas, canvas_draw);
   layer_add_child(root, s_canvas);
 
-  // Clock (top-right, above face)
   time_t now = time(NULL);
   struct tm *t = localtime(&now);
   snprintf(s_clock_text, sizeof(s_clock_text), "%02d:%02d", t->tm_hour, t->tm_min);
@@ -487,13 +487,11 @@ static void window_load(Window *w) {
   text_layer_set_text(s_clock_layer, s_clock_text);
   layer_add_child(root, text_layer_get_layer(s_clock_layer));
 
-  s_face_path = gpath_create(&s_face_path_info);
-
-  s_dictation = dictation_session_create(sizeof(s_dictated_text),
-                                         dictation_session_callback, NULL);
+  s_face_path = gpath_create(&s_face_info);
+  s_dictation = dictation_session_create(sizeof(s_dictated_text), dictation_cb, NULL);
 }
 
-static void window_unload(Window *w) {
+static void main_unload(Window *w) {
   cancel_watchdog();
   stop_wave();
   if (s_face_path)   { gpath_destroy(s_face_path);            s_face_path   = NULL; }
@@ -504,28 +502,22 @@ static void window_unload(Window *w) {
 
 // ── App lifecycle ─────────────────────────────────────────────────────────
 static void init(void) {
-  app_message_register_inbox_received(inbox_received_callback);
-  app_message_register_inbox_dropped(inbox_dropped_callback);
-  app_message_register_outbox_failed(outbox_failed_callback);
-  app_message_register_outbox_sent(outbox_sent_callback);
+  app_message_register_inbox_received(inbox_received);
+  app_message_register_inbox_dropped(inbox_dropped);
+  app_message_register_outbox_failed(outbox_failed);
+  app_message_register_outbox_sent(outbox_sent);
   app_message_open(MSG_BUFFER_SIZE, MSG_BUFFER_SIZE);
-
   tick_timer_service_subscribe(MINUTE_UNIT, tick_handler);
 
   s_log_window = window_create();
   window_set_window_handlers(s_log_window, (WindowHandlers){
-    .load   = log_window_load,
-    .appear = log_window_appear,
-    .unload = log_window_unload,
-  });
-  window_set_click_config_provider(s_log_window, log_click_config);
+    .load = log_load, .appear = log_appear, .unload = log_unload });
+  window_set_click_config_provider(s_log_window, log_clicks);
 
   s_window = window_create();
   window_set_window_handlers(s_window, (WindowHandlers){
-    .load   = window_load,
-    .unload = window_unload,
-  });
-  window_set_click_config_provider(s_window, click_config_provider);
+    .load = main_load, .unload = main_unload });
+  window_set_click_config_provider(s_window, click_provider);
   window_stack_push(s_window, true);
 }
 
@@ -535,9 +527,4 @@ static void deinit(void) {
   if (s_window)     { window_destroy(s_window);     s_window     = NULL; }
 }
 
-int main(void) {
-  init();
-  app_event_loop();
-  deinit();
-  return 0;
-}
+int main(void) { init(); app_event_loop(); deinit(); return 0; }
