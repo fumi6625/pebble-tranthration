@@ -1,11 +1,11 @@
 {
   "uuid": "13628c16-2cc0-42db-8b69-3e006aa44ac4",
-  "shortName": "SpeechTrans",
-  "longName": "Speech Translator",
-  "companyName": "User",
-  "versionLabel": "1.0",
+  "shortName": "Voice J to E",
+  "longName": "Voice J to E",
+  "companyName": "zefuru",
+  "versionLabel": "1.1",
   "sdkVersion": "3",
-  "targetPlatforms": ["basalt", "diorite"],
+  "targetPlatforms": ["basalt", "chalk", "diorite", "emery"],
   "watchapp": {
     "watchface": false
   },
