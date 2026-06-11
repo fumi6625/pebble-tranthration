@@ -127,16 +127,16 @@ static void build_layout(GRect bounds) {
   int W = bounds.size.w;
   int H = bounds.size.h;
 
-  // Face scale: proportional to HTML mockup (84px in 228px screen height)
-  int face_h = H * 84 / 228;  // 37% of H
+  // Face scale: smaller than the mockup so the prompt below stays readable
+  int face_h = H * 64 / 228;  // ~28% of H
   int sn = face_h;             // scale numerator
   int sd = 77;                 // scale denominator (SVG face height 22..99 = 77)
 
-  // Face center: horizontally centered; vertically ~55% on rect, ~50% on round
+  // Face center: horizontally centered; sits high so 18pt prompt fits below
 #ifdef PBL_ROUND
-  int face_cy = H * 50 / 100;
+  int face_cy = H * 44 / 100;
 #else
-  int face_cy = H * 55 / 100;
+  int face_cy = H * 39 / 100;
 #endif
   int face_cx = W / 2;
 
@@ -227,6 +227,112 @@ static void draw_face(GContext *ctx) {
   graphics_draw_line(ctx, s_sw3b, s_sw3c);
 }
 
+// ── Right-edge action labels (REC / LOG) ──────────────────────────────────
+// SELECT = REC/STP (vertical center), DOWN = LOG (lower). Drawn in all states.
+static void draw_right_labels(GContext *ctx, int W, int H) {
+#ifdef PBL_ROUND
+  int lx = W - W * 22 / 100;   // inset from the curved right edge
+  int lw = W * 20 / 100;
+  int rec_y = H / 2 - 24;
+  int log_y = H / 2 + 4;
+#else
+  int lx = W - 32;
+  int lw = 30;
+  int rec_y = H / 2 - 10;
+  int log_y = H * 80 / 100;
+#endif
+
+  // REC (or STP while listening)
+#ifdef PBL_COLOR
+  graphics_context_set_text_color(ctx,
+    (s_state == STATE_LISTENING) ? GColorWhite : GColorRed);
+#else
+  graphics_context_set_text_color(ctx, GColorBlack);
+#endif
+  graphics_draw_text(ctx,
+    (s_state == STATE_LISTENING) ? "STP" : "REC",
+    fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
+    GRect(lx, rec_y, lw, 22),
+    GTextOverflowModeFill, GTextAlignmentRight, NULL);
+
+  // LOG
+#ifdef PBL_COLOR
+  graphics_context_set_text_color(ctx, GColorWhite);
+#else
+  graphics_context_set_text_color(ctx, GColorBlack);
+#endif
+  graphics_draw_text(ctx, "LOG",
+    fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD),
+    GRect(lx, log_y, lw, 20),
+    GTextOverflowModeFill, GTextAlignmentRight, NULL);
+}
+
+// ── Pick the largest readable font that suits the text length ──────────────
+static const char *font_for_len(int len) {
+  if (len <= 18)  return FONT_KEY_GOTHIC_28_BOLD;
+  if (len <= 40)  return FONT_KEY_GOTHIC_24_BOLD;
+  if (len <= 90)  return FONT_KEY_GOTHIC_18_BOLD;
+  return FONT_KEY_GOTHIC_14_BOLD;
+}
+
+// ── Result screen: full-area, large, high-contrast translation ─────────────
+static void draw_result(GContext *ctx, int W, int H) {
+  // Small "JP → EN" header (clock sits top-right)
+#ifdef PBL_COLOR
+  graphics_context_set_text_color(ctx, GColorWhite);
+#else
+  graphics_context_set_text_color(ctx, GColorBlack);
+#endif
+#ifdef PBL_ROUND
+  graphics_draw_text(ctx, "JP \xe2\x86\x92 EN",
+    fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
+    GRect(0, H / 20, W, 22),
+    GTextOverflowModeFill, GTextAlignmentCenter, NULL);
+#else
+  graphics_draw_text(ctx, "JP \xe2\x86\x92 EN",
+    fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
+    GRect(8, 2, W - 60, 22),
+    GTextOverflowModeFill, GTextAlignmentLeft, NULL);
+#endif
+
+  // Card region (leaves room for the right-edge REC/LOG labels)
+#ifdef PBL_ROUND
+  int top = H / 5;
+  int lm  = W / 7;
+  int rm  = W / 7;
+#else
+  int top = H / 7;
+  int lm  = 6;
+  int rm  = 36;
+#endif
+  int card_x = lm;
+  int card_y = top;
+  int card_w = W - lm - rm;
+  int card_h = H - top - H / 16;
+
+  GFont font = fonts_get_system_font(font_for_len((int)strlen(s_translated)));
+  GRect pad  = GRect(card_x + 5, card_y + 4, card_w - 10, card_h - 8);
+
+#ifdef PBL_COLOR
+  // White rounded card with dark-navy text for maximum contrast
+  graphics_context_set_fill_color(ctx, GColorWhite);
+  graphics_fill_rect(ctx, GRect(card_x, card_y, card_w, card_h), 6, GCornersAll);
+  graphics_context_set_text_color(ctx, GColorFromRGB(0, 40, 90));
+#else
+  graphics_context_set_text_color(ctx, GColorBlack);
+#endif
+
+  // Vertically center the wrapped text within the card
+  GSize ts = graphics_text_layout_get_content_size(s_translated, font,
+    pad, GTextOverflowModeWordWrap, GTextAlignmentCenter);
+  int ty = pad.origin.y;
+  if (ts.h < pad.size.h) ty += (pad.size.h - ts.h) / 2;
+
+  graphics_draw_text(ctx, s_translated, font,
+    GRect(pad.origin.x, ty, pad.size.w, pad.size.h),
+    GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
+}
+
 // ── Main canvas ───────────────────────────────────────────────────────────
 static void canvas_draw(Layer *layer, GContext *ctx) {
   GRect b = layer_get_bounds(layer);
@@ -241,73 +347,36 @@ static void canvas_draw(Layer *layer, GContext *ctx) {
 #endif
   graphics_fill_rect(ctx, b, 0, GCornerNone);
 
-  // Face outline + features
+  // ── RESULT: dedicate the whole screen to the readable translation ───────
+  if (s_state == STATE_RESULT && s_translated[0]) {
+    draw_result(ctx, W, H);
+    draw_right_labels(ctx, W, H);
+    return;
+  }
+
+  // ── HOME / LISTENING: face + title + prompt ─────────────────────────────
   draw_face(ctx);
 
-  // ── "JP→EN" title ─────────────────────────────────────────────────────
-  // U+2192 (→) = \xe2\x86\x92
+  // "JP→EN" title  (U+2192 → = \xe2\x86\x92)
 #ifdef PBL_COLOR
   graphics_context_set_text_color(ctx, GColorWhite);
 #else
   graphics_context_set_text_color(ctx, GColorBlack);
 #endif
-  int title_y = H / 10;
-  int title_h = H / 6;
+  int title_y = H / 12;
 #ifdef PBL_ROUND
-  // Inset title on round display to avoid edge cutoff
   graphics_draw_text(ctx, "JP \xe2\x86\x92 EN",
     fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD),
-    GRect(W / 8, title_y, W * 6 / 8, title_h),
+    GRect(W / 8, title_y, W * 6 / 8, 30),
     GTextOverflowModeFill, GTextAlignmentCenter, NULL);
 #else
   graphics_draw_text(ctx, "JP \xe2\x86\x92 EN",
     fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD),
-    GRect(0, title_y, W - 18, title_h),
+    GRect(0, title_y, W - 18, 30),
     GTextOverflowModeFill, GTextAlignmentCenter, NULL);
 #endif
 
-  // ── Right-edge labels (rect only; round uses center-bottom) ───────────
-#ifdef PBL_ROUND
-  // On round: REC label centered at right quadrant, LOG below
-#ifdef PBL_COLOR
-  graphics_context_set_text_color(ctx,
-    (s_state == STATE_LISTENING) ? GColorWhite : GColorRed);
-#else
-  graphics_context_set_text_color(ctx, GColorBlack);
-#endif
-  graphics_draw_text(ctx,
-    (s_state == STATE_LISTENING) ? "STP" : "REC",
-    fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD),
-    GRect(W - W/6, H/2 - 8, W/6 - 4, 16),
-    GTextOverflowModeFill, GTextAlignmentRight, NULL);
-#ifdef PBL_COLOR
-  graphics_context_set_text_color(ctx, GColorBlack);
-#else
-  graphics_context_set_text_color(ctx, GColorBlack);
-#endif
-  graphics_draw_text(ctx, "LOG",
-    fonts_get_system_font(FONT_KEY_GOTHIC_14),
-    GRect(W - W/6, H * 3/4, W/6 - 4, 16),
-    GTextOverflowModeFill, GTextAlignmentRight, NULL);
-#else
-  // Rect: REC at center-right edge (middle button), LOG at lower-right (down button)
-#ifdef PBL_COLOR
-  graphics_context_set_text_color(ctx,
-    (s_state == STATE_LISTENING) ? GColorWhite : GColorRed);
-#else
-  graphics_context_set_text_color(ctx, GColorBlack);
-#endif
-  graphics_draw_text(ctx,
-    (s_state == STATE_LISTENING) ? "STP" : "REC",
-    fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD),
-    GRect(W - 26, H/2 - 8, 24, 16),
-    GTextOverflowModeFill, GTextAlignmentRight, NULL);
-  graphics_context_set_text_color(ctx, GColorBlack);
-  graphics_draw_text(ctx, "LOG",
-    fonts_get_system_font(FONT_KEY_GOTHIC_14),
-    GRect(W - 26, H * 84/100, 24, 16),
-    GTextOverflowModeFill, GTextAlignmentRight, NULL);
-#endif
+  draw_right_labels(ctx, W, H);
 
   // ── Prompt / listening text ────────────────────────────────────────────
   int prompt_y  = s_face_bot_y + H / 28;
@@ -315,10 +384,10 @@ static void canvas_draw(Layer *layer, GContext *ctx) {
   int prompt_lm = W / 8;
   int prompt_w  = W * 6 / 8;
 #else
-  int prompt_lm = 4;
-  int prompt_w  = W - 28;
+  int prompt_lm = 6;
+  int prompt_w  = W - 38;
 #endif
-  int prompt_h  = H - prompt_y - H / 12;
+  int prompt_h  = H - prompt_y - H / 16;
 
 #ifdef PBL_COLOR
   graphics_context_set_text_color(ctx, GColorWhite);
@@ -356,15 +425,13 @@ static void canvas_draw(Layer *layer, GContext *ctx) {
                          1, GCornersAll);
     }
   } else {
-    // HOME: "日本語で話しかけてください。"  RESULT: translated text
-    const char *body = (s_state == STATE_RESULT && s_translated[0])
-      ? s_translated
-      : "\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e\xe3\x81\xa7"
-        "\xe8\xa9\xb1\xe3\x81\x97\xe3\x81\x8b\xe3\x81\x91"
-        "\xe3\x81\xa6\xe3\x81\x8f\xe3\x81\xa0\xe3\x81\x95"
-        "\xe3\x81\x84\xe3\x80\x82";
-    graphics_draw_text(ctx, body,
-      fonts_get_system_font(FONT_KEY_GOTHIC_14),
+    // HOME prompt: "日本語で話しかけてください。"
+    graphics_draw_text(ctx,
+      "\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e\xe3\x81\xa7"
+      "\xe8\xa9\xb1\xe3\x81\x97\xe3\x81\x8b\xe3\x81\x91"
+      "\xe3\x81\xa6\xe3\x81\x8f\xe3\x81\xa0\xe3\x81\x95"
+      "\xe3\x81\x84\xe3\x80\x82",
+      fonts_get_system_font(FONT_KEY_GOTHIC_18),
       GRect(prompt_lm, prompt_y, prompt_w, prompt_h),
       GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
   }
@@ -428,50 +495,43 @@ static void log_canvas_draw(Layer *layer, GContext *ctx) {
     return;
   }
 
-  // Card height scales with screen
-  int card_h = H * 52 / 168;  // 52px on 168px screen, proportional
+  // Each card shows a bold timestamp + the English translation, large & legible.
+  // (The recognized Japanese is mostly kanji, which the system font can't
+  //  render, so the card focuses on the readable English result.)
+  int card_h   = H * 56 / 168;
   int card_gap = H * 6 / 168;
-  int lm = W > 160 ? 8 : 6;  // card left margin (wider on large screens)
-  int y = hdr_h + 4;
+  int lm = W > 160 ? 10 : 6;
+  int y  = hdr_h + 4;
 
   for (int i = 0; i < s_log_n && y + card_h <= H; i++) {
 #ifdef PBL_COLOR
-    graphics_context_set_fill_color(ctx,   GColorWhite);
-    graphics_context_set_stroke_color(ctx, GColorFromRGB(170, 200, 255));
+    graphics_context_set_fill_color(ctx, GColorWhite);
 #else
-    graphics_context_set_fill_color(ctx,   GColorWhite);
-    graphics_context_set_stroke_color(ctx, GColorBlack);
+    graphics_context_set_fill_color(ctx, GColorWhite);
 #endif
-    graphics_fill_rect(ctx, GRect(lm, y, W - lm*2, card_h), 4, GCornersAll);
+    graphics_fill_rect(ctx, GRect(lm, y, W - lm*2, card_h), 5, GCornersAll);
 
-    // Timestamp
+    // Timestamp (top-left, accent color)
 #ifdef PBL_COLOR
-    graphics_context_set_text_color(ctx, GColorFromRGB(0, 85, 170));
+    graphics_context_set_text_color(ctx, GColorFromRGB(0, 110, 200));
 #else
     graphics_context_set_text_color(ctx, GColorBlack);
 #endif
     graphics_draw_text(ctx, s_log[i].timestamp,
-      fonts_get_system_font(FONT_KEY_GOTHIC_14),
-      GRect(lm+4, y+2, 44, 14),
+      fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD),
+      GRect(lm+6, y+3, 48, 16),
       GTextOverflowModeFill, GTextAlignmentLeft, NULL);
 
-    // Japanese original
-    graphics_context_set_text_color(ctx, GColorBlack);
-    graphics_draw_text(ctx, s_log[i].original,
-      fonts_get_system_font(FONT_KEY_GOTHIC_14),
-      GRect(lm+4, y + card_h/3, W - lm*2 - 8, 14),
-      GTextOverflowModeFill, GTextAlignmentLeft, NULL);
-
-    // English translation
+    // English translation — the main content, large and high-contrast
 #ifdef PBL_COLOR
-    graphics_context_set_text_color(ctx, GColorYellow);
+    graphics_context_set_text_color(ctx, GColorFromRGB(0, 40, 90));
 #else
     graphics_context_set_text_color(ctx, GColorBlack);
 #endif
     graphics_draw_text(ctx, s_log[i].translated,
-      fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD),
-      GRect(lm+4, y + card_h*3/5, W - lm*2 - 8, 16),
-      GTextOverflowModeFill, GTextAlignmentLeft, NULL);
+      fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
+      GRect(lm+6, y + 20, W - lm*2 - 12, card_h - 24),
+      GTextOverflowModeWordWrap, GTextAlignmentLeft, NULL);
 
     y += card_h + card_gap;
   }
