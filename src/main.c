@@ -583,6 +583,7 @@ static void main_load(Window *w) {
   Layer *root   = window_get_root_layer(w);
   GRect bounds  = layer_get_bounds(root);
   int   W       = bounds.size.w;
+  int   H       = bounds.size.h;
 
   // Build face path and all element positions for this screen size
   build_layout(bounds);
