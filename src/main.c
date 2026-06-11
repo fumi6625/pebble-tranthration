@@ -6,6 +6,10 @@
 // diorite (Pebble 2 / 2 SE):         144×168, B&W,   rect
 // emery   (Pebble Time 2):           200×228, color, rect
 
+#ifndef MAX
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+#endif
+
 #define KEY_TEXT             0
 #define KEY_LANG             1
 #define KEY_RESULT           2
@@ -579,7 +583,6 @@ static void main_load(Window *w) {
   Layer *root   = window_get_root_layer(w);
   GRect bounds  = layer_get_bounds(root);
   int   W       = bounds.size.w;
-  int   H       = bounds.size.h;
 
   // Build face path and all element positions for this screen size
   build_layout(bounds);
