@@ -295,11 +295,11 @@ static void draw_rotate_hint(GContext *ctx, int W, int H) {
 
 #ifdef PBL_ROUND
   int cx = W - W * 18 / 100;
-  int cy = H * 14 / 100;
+  int cy = H * 14 / 100 + 10;
   int r  = H * 7 / 100;
 #else
   int cx = W - 18;
-  int cy = H * 11 / 100;
+  int cy = H * 11 / 100 + 10;
   int r  = 10;
 #endif
 
