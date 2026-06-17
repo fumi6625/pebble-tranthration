@@ -804,9 +804,7 @@ static void send_translation_request(void) {
   cancel_watchdog();
   DictionaryIterator *iter;
   if (app_message_outbox_begin(&iter) != APP_MSG_OK) return;
-  char safe[200];
-  snprintf(safe, sizeof(safe), "%s", s_dictated);
-  dict_write_cstring(iter, KEY_TEXT, safe);
+  dict_write_cstring(iter, KEY_TEXT, s_dictated);
   dict_write_cstring(iter, KEY_LANG, s_mode_ejp ? "en|ja" : "ja|en");
   if (app_message_outbox_send() != APP_MSG_OK) return;
   s_watchdog = app_timer_register(TRANSLATE_TIMEOUT_MS, watchdog_cb, NULL);
@@ -897,7 +895,6 @@ static void main_load(Window *w) {
   Layer *root   = window_get_root_layer(w);
   GRect bounds  = layer_get_bounds(root);
   int   W       = bounds.size.w;
-  int   H       = bounds.size.h;
 
   // Build face path and all element positions for this screen size
   build_layout(bounds);
@@ -908,6 +905,7 @@ static void main_load(Window *w) {
 
   // Clock TextLayer — top-right on rect, top-center on round
 #ifdef PBL_ROUND
+  int H = bounds.size.h;
   GRect clock_frame = GRect(W/2 - 24, H/20, 48, 14);
 #else
   GRect clock_frame = GRect(W - 50, 1, 48, 14);
