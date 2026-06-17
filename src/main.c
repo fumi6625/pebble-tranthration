@@ -44,6 +44,13 @@ static int               s_remaining  = DICTATION_LIMIT;
 static char              s_count_buf[24];
 static bool              s_mode_ejp       = false; // false=JP→EN, true=EN→JP
 static bool              s_result_flipped = false; // 180° flip to show partner
+static int               s_flip_phase  = -1;       // -1=off; 0-7=mode-toggle squish anim
+static AppTimer         *s_flip_timer  = NULL;
+static int               s_card_phase  = -1;       // -1=off; 0-5=result-flip squish anim
+static AppTimer         *s_card_timer  = NULL;
+// Squish % per animation phase (100=full width, 0=collapsed)
+static const uint8_t FLIP_SQ[8] = {80, 55, 30, 5, 5, 30, 55, 80};
+static const uint8_t CARD_SQ[6] = {75, 40, 10, 10, 40, 75};
 
 // ── Windows / layers ──────────────────────────────────────────────────────
 static Window           *s_win      = NULL;
@@ -85,12 +92,18 @@ static int    s_face_bot_y;            // y of face bottom (for prompt placement
 // ── Forward declarations ──────────────────────────────────────────────────
 static void start_dictation(void);
 static void send_translation_request(void);
+static void flip_tick(void *ctx);
+static void card_flip_tick(void *ctx);
 
 // ── Dictation count (persistent, resets each calendar month) ─────────────
 static void update_count_buf(void) {
-  // "後NN回可能"  U+5F8C後 U+56DE回 U+53EF可 U+80FD能
-  snprintf(s_count_buf, sizeof(s_count_buf),
-           "\xe5\xbe\x8c%d\xe5\x9b\x9e\xe5\x8f\xaf\xe8\x83\xbd", s_remaining);
+  if (s_mode_ejp) {
+    snprintf(s_count_buf, sizeof(s_count_buf), "%d left/month", s_remaining);
+  } else {
+    // "後NN回可能"
+    snprintf(s_count_buf, sizeof(s_count_buf),
+             "\xe5\xbe\x8c%d\xe5\x9b\x9e\xe5\x8f\xaf\xe8\x83\xbd", s_remaining);
+  }
 }
 static void load_dictation_count(void) {
   time_t now = time(NULL);
@@ -162,6 +175,58 @@ static void start_wave(void) {
   s_wave_timer = app_timer_register(WAVE_TIMER_MS, wave_timer_cb, NULL);
 }
 
+// ── Mode-toggle squish animation (8 frames, 80ms each) ───────────────────
+// Phases 0-3: screen squishes to zero (card disappears into vertical axis)
+// At phase 4: the mode actually toggles (face flips, colours swap)
+// Phases 4-7: screen unsquishes back to full width
+static void flip_tick(void *context) {
+  s_flip_phase++;
+  if (s_flip_phase == 4) {
+    // Mid-point: commit the mode toggle
+    s_mode_ejp       = !s_mode_ejp;
+    s_dictated[0]    = '\0';
+    s_translated[0]  = '\0';
+    s_result_flipped = false;
+    if (s_face_path) { gpath_destroy(s_face_path); s_face_path = NULL; }
+    build_layout(layer_get_bounds(window_get_root_layer(s_win)));
+    s_face_path = gpath_create(&s_face_info);
+    if (s_clock_tl) {
+#ifdef PBL_COLOR
+      text_layer_set_text_color(s_clock_tl,
+        s_mode_ejp ? GColorBlack : GColorWhite);
+#endif
+    }
+    update_count_buf();
+  }
+  canvas_dirty();
+  if (s_flip_phase < 7) {
+    s_flip_timer = app_timer_register(80, flip_tick, NULL);
+  } else {
+    s_flip_phase = -1;
+    s_flip_timer = NULL;
+    canvas_dirty();
+  }
+}
+
+// ── Result card squish animation (6 frames, 80ms each) ───────────────────
+// Phases 0-2: card squishes to zero
+// At phase 3: s_result_flipped toggles
+// Phases 3-5: card unsquishes
+static void card_flip_tick(void *context) {
+  s_card_phase++;
+  if (s_card_phase == 3) {
+    s_result_flipped = !s_result_flipped;
+  }
+  canvas_dirty();
+  if (s_card_phase < 5) {
+    s_card_timer = app_timer_register(80, card_flip_tick, NULL);
+  } else {
+    s_card_phase = -1;
+    s_card_timer = NULL;
+    canvas_dirty();
+  }
+}
+
 // ── Layout builder ────────────────────────────────────────────────────────
 // Called once in main_load to compute all positions from actual screen bounds.
 // Scales the SVG face to 37% of screen height, centered on screen.
@@ -178,7 +243,7 @@ static void build_layout(GRect bounds) {
 #ifdef PBL_ROUND
   int face_cy = H * 46 / 100;
 #else
-  int face_cy = H * 48 / 100;
+  int face_cy = H * 40 / 100;
 #endif
   int face_cx = W / 2;
 
@@ -216,36 +281,93 @@ static void build_layout(GRect bounds) {
 #undef FPX
 }
 
-// ── 180° framebuffer rotation (swap pixel (x,y) ↔ (W-1-x, H-1-y)) ────────
-// Used to display the result flipped for the person across the table.
-// Color platforms only — B&W framebuffer is bit-packed and handled separately.
+// ── 180° rotation of a rectangular region only ────────────────────────────
+// Rotates pixels within `region` only — buttons/clock outside are untouched.
+// Color platforms only (B&W bit-packed framebuffer not supported).
 #ifdef PBL_COLOR
-static void rotate_framebuffer_180(GContext *ctx) {
+static void rotate_region_180(GContext *ctx, GRect region) {
   GBitmap *fb = graphics_capture_frame_buffer(ctx);
   if (!fb) return;
-  GRect b    = gbitmap_get_bounds(fb);
-  int W      = b.size.w;
-  int H      = b.size.h;
-  int stride = gbitmap_get_bytes_per_row(fb);
+  GRect fb_b  = gbitmap_get_bounds(fb);
+  int FW      = fb_b.size.w;
+  int FH      = fb_b.size.h;
+  int stride  = gbitmap_get_bytes_per_row(fb);
   uint8_t *data = (uint8_t *)gbitmap_get_data(fb);
-  for (int y = 0; y < H / 2; y++) {
-    uint8_t *top = data + y          * stride;
-    uint8_t *bot = data + (H-1-y)   * stride;
-    for (int x = 0; x < W; x++) {
+
+  int rx = region.origin.x;
+  int ry = region.origin.y;
+  int rw = region.size.w;
+  int rh = region.size.h;
+  // Clamp to framebuffer bounds
+  if (rx < 0) { rw += rx; rx = 0; }
+  if (ry < 0) { rh += ry; ry = 0; }
+  if (rx + rw > FW) rw = FW - rx;
+  if (ry + rh > FH) rh = FH - ry;
+  if (rw <= 0 || rh <= 0) { graphics_release_frame_buffer(ctx, fb); return; }
+
+  for (int y = 0; y < rh / 2; y++) {
+    uint8_t *top = data + (ry + y)          * stride + rx;
+    uint8_t *bot = data + (ry + rh - 1 - y) * stride + rx;
+    for (int x = 0; x < rw; x++) {
       uint8_t tmp      = top[x];
-      top[x]           = bot[W-1-x];
-      bot[W-1-x]       = tmp;
+      top[x]           = bot[rw - 1 - x];
+      bot[rw - 1 - x]  = tmp;
     }
   }
-  if (H & 1) {
-    uint8_t *mid = data + (H / 2) * stride;
-    for (int x = 0; x < W / 2; x++) {
-      uint8_t tmp = mid[x]; mid[x] = mid[W-1-x]; mid[W-1-x] = tmp;
+  if (rh & 1) {
+    uint8_t *mid = data + (ry + rh / 2) * stride + rx;
+    for (int x = 0; x < rw / 2; x++) {
+      uint8_t tmp = mid[x]; mid[x] = mid[rw-1-x]; mid[rw-1-x] = tmp;
     }
   }
   graphics_release_frame_buffer(ctx, fb);
 }
 #endif
+
+// ── 360° rotation-arrow hint near the UP button ───────────────────────────
+// Draws a circular arrow (arc + arrowhead) on the right edge near the top,
+// indicating that the UP button cycles translation mode.
+static void draw_rotate_hint(GContext *ctx, int W, int H) {
+#ifdef PBL_COLOR
+  graphics_context_set_stroke_color(ctx, GColorWhite);
+  graphics_context_set_fill_color(ctx, GColorWhite);
+#else
+  graphics_context_set_stroke_color(ctx, GColorBlack);
+  graphics_context_set_fill_color(ctx, GColorBlack);
+#endif
+
+#ifdef PBL_ROUND
+  int cx = W - W * 18 / 100;
+  int cy = H * 14 / 100;
+  int r  = H * 7 / 100;
+#else
+  int cx = W - 18;
+  int cy = H * 11 / 100;
+  int r  = 10;
+#endif
+
+  // Draw arc ~300° (leaving a gap at the top-right where the arrowhead goes)
+  graphics_context_set_stroke_width(ctx, 2);
+  graphics_draw_arc(ctx, GRect(cx - r, cy - r, r * 2, r * 2),
+                    GOvalScaleModeFitCircle,
+                    DEG_TO_TRIGANGLE(30), DEG_TO_TRIGANGLE(330));
+
+  // Arrowhead at the end of the arc (near 330°) pointing clockwise
+  // 330° on unit circle: cos=-0.866, sin=-0.5
+  int ax = cx + r * 87 / 100;   // cos(30°)≈0.866
+  int ay = cy - r * 50 / 100;   // sin(30°)≈0.5 (above center)
+  GPoint tip = GPoint(ax, ay);
+  GPoint p1  = GPoint(ax - 4, ay - 5);
+  GPoint p2  = GPoint(ax + 3, ay - 5);
+  GPoint pts[3] = { tip, p1, p2 };
+  const GPathInfo arrow_info = { .num_points = 3, .points = pts };
+  GPath *arrow = gpath_create(&arrow_info);
+  if (arrow) {
+    gpath_draw_filled(ctx, arrow);
+    gpath_destroy(arrow);
+  }
+  graphics_context_set_stroke_width(ctx, 1);
+}
 
 // ── Draw face ─────────────────────────────────────────────────────────────
 static void draw_face(GContext *ctx) {
@@ -315,8 +437,12 @@ static void draw_right_labels(GContext *ctx, int W, int H) {
 
   // REC (or STP while listening)
 #ifdef PBL_COLOR
-  graphics_context_set_text_color(ctx,
-    (s_state == STATE_LISTENING) ? GColorWhite : GColorRed);
+  if (s_state == STATE_LISTENING) {
+    graphics_context_set_text_color(ctx, GColorWhite);
+  } else {
+    graphics_context_set_text_color(ctx,
+      s_mode_ejp ? GColorFromRGB(150, 0, 0) : GColorRed);
+  }
 #else
   graphics_context_set_text_color(ctx, GColorBlack);
 #endif
@@ -328,7 +454,7 @@ static void draw_right_labels(GContext *ctx, int W, int H) {
 
   // LOG
 #ifdef PBL_COLOR
-  graphics_context_set_text_color(ctx, GColorWhite);
+  graphics_context_set_text_color(ctx, s_mode_ejp ? GColorBlack : GColorWhite);
 #else
   graphics_context_set_text_color(ctx, GColorBlack);
 #endif
@@ -382,27 +508,45 @@ static void draw_result(GContext *ctx, int W, int H) {
   int card_w = W - lm - rm;
   int card_h = H - top - H / 16;
 
+  // Apply card squish during animation: scale x around card centre
+  int sq_pct = (s_card_phase >= 0 && s_card_phase < 6)
+               ? CARD_SQ[s_card_phase] : 100;
+  if (sq_pct < 100) {
+    int mid   = card_x + card_w / 2;
+    int hw    = card_w / 2 * sq_pct / 100;
+    card_x    = mid - hw;
+    card_w    = hw * 2;
+    if (card_w < 2) card_w = 2;
+  }
+
   GFont font = fonts_get_system_font(font_for_len((int)strlen(s_translated)));
+  GRect card_rect = GRect(card_x, card_y, card_w, card_h);
   GRect pad  = GRect(card_x + 5, card_y + 4, card_w - 10, card_h - 8);
 
 #ifdef PBL_COLOR
-  // White rounded card with dark-navy text for maximum contrast
   graphics_context_set_fill_color(ctx, GColorWhite);
-  graphics_fill_rect(ctx, GRect(card_x, card_y, card_w, card_h), 6, GCornersAll);
+  graphics_fill_rect(ctx, card_rect, 6, GCornersAll);
   graphics_context_set_text_color(ctx, GColorFromRGB(0, 40, 90));
 #else
   graphics_context_set_text_color(ctx, GColorBlack);
 #endif
 
-  // Vertically center the wrapped text within the card
-  GSize ts = graphics_text_layout_get_content_size(s_translated, font,
-    pad, GTextOverflowModeWordWrap, GTextAlignmentCenter);
-  int ty = pad.origin.y;
-  if (ts.h < pad.size.h) ty += (pad.size.h - ts.h) / 2;
+  if (sq_pct >= 20 && pad.size.w > 10) {
+    GSize ts = graphics_text_layout_get_content_size(s_translated, font,
+      pad, GTextOverflowModeWordWrap, GTextAlignmentCenter);
+    int ty = pad.origin.y;
+    if (ts.h < pad.size.h) ty += (pad.size.h - ts.h) / 2;
+    graphics_draw_text(ctx, s_translated, font,
+      GRect(pad.origin.x, ty, pad.size.w, pad.size.h),
+      GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
+  }
 
-  graphics_draw_text(ctx, s_translated, font,
-    GRect(pad.origin.x, ty, pad.size.w, pad.size.h),
-    GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
+  // After drawing the card, rotate only the card region if flipped
+#ifdef PBL_COLOR
+  if (s_result_flipped && sq_pct >= 95) {
+    rotate_region_180(ctx, card_rect);
+  }
+#endif
 }
 
 // ── Main canvas ───────────────────────────────────────────────────────────
@@ -410,6 +554,10 @@ static void canvas_draw(Layer *layer, GContext *ctx) {
   GRect b = layer_get_bounds(layer);
   int W = b.size.w;
   int H = b.size.h;
+
+  // Squish factor for mode-toggle animation (100=full, 0=collapsed)
+  int sq_pct = (s_flip_phase >= 0 && s_flip_phase < 8)
+               ? FLIP_SQ[s_flip_phase] : 100;
 
   // Background: sky-blue (JP→EN) / warm-orange (EN→JP)
 #ifdef PBL_COLOR
@@ -420,49 +568,101 @@ static void canvas_draw(Layer *layer, GContext *ctx) {
 #endif
   graphics_fill_rect(ctx, b, 0, GCornerNone);
 
+  // During squish: draw a vertical stripe narrower than full width
+  if (sq_pct < 100) {
+    int mid = W / 2;
+    int hw  = W / 2 * sq_pct / 100;
+    // Reveal background colour outside the stripe (already filled above)
+    // Draw the content stripe clipped — we use a narrowed version of all rects
+    // by offsetting x toward centre and reducing widths by (1 - sq_pct/100).
+    // Implemented below by adjusting all draw positions proportionally.
+    (void)mid; (void)hw; // positions computed per-element below
+  }
+
+  // Helper macro: squish an x-coordinate toward screen centre
+  // sq_pct=100 → identity; sq_pct=0 → all x collapse to W/2
+  #define SQX(x) (W/2 + ((x) - W/2) * sq_pct / 100)
+  #define SQW(w) ((w) * sq_pct / 100)
+
   // ── RESULT: dedicate the whole screen to the readable translation ───────
   if (s_state == STATE_RESULT && s_translated[0]) {
     draw_result(ctx, W, H);
     draw_right_labels(ctx, W, H);
-#ifdef PBL_COLOR
-    if (s_result_flipped) rotate_framebuffer_180(ctx);
-#endif
     return;
   }
 
   // ── HOME / LISTENING: title + face + prompt ─────────────────────────────
-  draw_face(ctx);
 
-  // App title — adapts to current translation direction
+  // Draw face (uses precomputed s_face_pts which are already squished via build_layout;
+  // during flip animation we manually squish the gpath points inline)
+  if (sq_pct < 100 && s_face_path) {
+    // Temporarily squish face points
+    GPoint tmp_pts[20];
+    for (int i = 0; i < 20; i++) {
+      tmp_pts[i].x = (int16_t)SQX(s_face_pts[i].x);
+      tmp_pts[i].y = s_face_pts[i].y;
+    }
+    GPathInfo tmp_info = { .num_points = 20, .points = tmp_pts };
+    GPath *tmp_path = gpath_create(&tmp_info);
+    if (tmp_path) {
+      GPath *saved = s_face_path;
+      s_face_path = tmp_path;
+      draw_face(ctx);
+      s_face_path = saved;
+      gpath_destroy(tmp_path);
+    }
+  } else {
+    draw_face(ctx);
+  }
+
+  // App title
   const char *title_text = s_mode_ejp ? "Voice E to J" : "Voice J to E";
 #ifdef PBL_COLOR
   graphics_context_set_text_color(ctx, s_mode_ejp ? GColorBlack : GColorWhite);
 #else
   graphics_context_set_text_color(ctx, GColorBlack);
 #endif
+  {
 #ifdef PBL_ROUND
-  graphics_draw_text(ctx, title_text,
-    fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD),
-    GRect(W / 8, 4, W * 6 / 8, 30),
-    GTextOverflowModeFill, GTextAlignmentCenter, NULL);
+    int tx = SQX(W / 8), tw = SQW(W * 6 / 8);
+    if (tw < 4) tw = 4;
+    graphics_draw_text(ctx, title_text,
+      fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD),
+      GRect(tx, 4, tw, 30),
+      GTextOverflowModeFill, GTextAlignmentCenter, NULL);
 #else
-  graphics_draw_text(ctx, title_text,
-    fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD),
-    GRect(0, 2, W, 30),
-    GTextOverflowModeFill, GTextAlignmentCenter, NULL);
+    int tx = SQX(0), tw = SQW(W);
+    if (tw < 4) tw = 4;
+    graphics_draw_text(ctx, title_text,
+      fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD),
+      GRect(tx, 2, tw, 30),
+      GTextOverflowModeFill, GTextAlignmentCenter, NULL);
 #endif
+  }
 
   draw_right_labels(ctx, W, H);
 
+  // Rotation hint (↻) near UP button — only on HOME, not animating
+  if (s_state == STATE_HOME && sq_pct == 100) {
+    draw_rotate_hint(ctx, W, H);
+  }
+
   // ── Prompt / listening text ────────────────────────────────────────────
   int prompt_y  = s_face_bot_y + H / 28;
+  // Larger font for the prompt (~2× GOTHIC_18)
+  const char *prompt_font = (H > 200)
+    ? FONT_KEY_GOTHIC_28_BOLD : FONT_KEY_GOTHIC_24_BOLD;
+  int prompt_h = (H > 200) ? 70 : 60;
+
 #ifdef PBL_ROUND
-  int prompt_lm = W / 8;
-  int prompt_w  = W * 6 / 8;
+  int prompt_lm = SQX(W / 8);
+  int prompt_w  = SQW(W * 6 / 8);
 #else
-  int prompt_lm = 6;
-  int prompt_w  = W - 38;
+  int prompt_lm = SQX(6);
+  int prompt_w  = SQW(W - 38);
 #endif
+  if (prompt_w < 4) prompt_w = 4;
+
 #ifdef PBL_COLOR
   graphics_context_set_text_color(ctx, GColorWhite);
 #else
@@ -474,18 +674,18 @@ static void canvas_draw(Layer *layer, GContext *ctx) {
     graphics_draw_text(ctx,
       "\xe8\x81\x9e\xe3\x81\x8d\xe5\x8f\x96\xe3\x82\x8a"
       "\xe4\xb8\xad\xe2\x80\xa6",
-      fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
+      fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD),
       GRect(prompt_lm, prompt_y, prompt_w, H / 8),
       GTextOverflowModeFill, GTextAlignmentCenter, NULL);
 
-    // Animated wave bars (13 bars × 4px wide, 3px gap = 88px total)
+    // Animated wave bars
     static const int8_t wh[4][13] = {
       { 5, 8,12,16,20,22,20,16,12, 8, 5, 4, 3},
       { 3, 5, 8,14,20,22,20,14, 8, 5, 3, 5, 8},
       { 5, 9,14,18,20,18,14, 9, 5, 4, 6,10,14},
       { 4, 7,12,18,22,20,16,12, 7, 5, 8,12,16},
     };
-    int bar_total = 13 * 7 - 3;  // 88px
+    int bar_total = 13 * 7 - 3;
     int x0 = (W - bar_total) / 2;
     int bar_base = H - H / 14;
 #ifdef PBL_COLOR
@@ -499,35 +699,35 @@ static void canvas_draw(Layer *layer, GContext *ctx) {
                          1, GCornersAll);
     }
   } else {
-    // HOME prompt — language depends on current mode
+    // HOME prompt
     if (s_mode_ejp) {
-      // EN→JP mode: English prompt
       graphics_draw_text(ctx, "Please speak\nin English",
-        fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
-        GRect(prompt_lm, prompt_y, prompt_w, 44),
+        fonts_get_system_font(prompt_font),
+        GRect(prompt_lm, prompt_y, prompt_w, prompt_h),
         GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
     } else {
-      // JP→EN mode: "日本語で\n話して下さい"
       graphics_draw_text(ctx,
         "\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e\xe3\x81\xa7\n"
         "\xe8\xa9\xb1\xe3\x81\x97\xe3\x81\xa6\xe4\xb8\x8b"
         "\xe3\x81\x95\xe3\x81\x84",
-        fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
-        GRect(prompt_lm, prompt_y, prompt_w, 44),
+        fonts_get_system_font(prompt_font),
+        GRect(prompt_lm, prompt_y, prompt_w, prompt_h),
         GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
     }
 
-    // Remaining dictation count at bottom: "後NN回可能"
+    // Remaining count — GOTHIC_18_BOLD (~2× GOTHIC_14)
 #ifdef PBL_COLOR
     graphics_context_set_text_color(ctx, s_mode_ejp ? GColorBlack : GColorWhite);
 #else
     graphics_context_set_text_color(ctx, GColorBlack);
 #endif
     graphics_draw_text(ctx, s_count_buf,
-      fonts_get_system_font(FONT_KEY_GOTHIC_14),
-      GRect(prompt_lm, H - 18, prompt_w, 16),
+      fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
+      GRect(prompt_lm, H - 26, prompt_w, 24),
       GTextOverflowModeFill, GTextAlignmentCenter, NULL);
   }
+  #undef SQX
+  #undef SQW
 }
 
 // ── Log canvas ────────────────────────────────────────────────────────────
@@ -686,27 +886,21 @@ static void outbox_sent(DictionaryIterator *iter, void *ctx) {}
 // ── Buttons ───────────────────────────────────────────────────────────────
 static void btn_up(ClickRecognizerRef r, void *ctx) {
   if (s_state == STATE_RESULT) {
-    // Flip result 180° so the person across the table can read it
-    s_result_flipped = !s_result_flipped;
-    canvas_dirty();
-  } else if (s_state != STATE_LISTENING) {
-    // Toggle translation direction JP→EN / EN→JP
-    s_mode_ejp       = !s_mode_ejp;
-    s_dictated[0]    = '\0';
-    s_translated[0]  = '\0';
-    s_result_flipped = false;
-    // Rebuild face GPath with new horizontal orientation
-    if (s_face_path) { gpath_destroy(s_face_path); s_face_path = NULL; }
-    build_layout(layer_get_bounds(window_get_root_layer(s_win)));
-    s_face_path = gpath_create(&s_face_info);
-    // Clock text colour: white on blue, black on orange
-    if (s_clock_tl) {
-#ifdef PBL_COLOR
-      text_layer_set_text_color(s_clock_tl,
-        s_mode_ejp ? GColorBlack : GColorWhite);
-#endif
+    // Start card flip animation (if not already animating)
+    if (s_card_phase < 0) {
+      s_card_phase = 0;
+      if (s_card_timer) { app_timer_cancel(s_card_timer); s_card_timer = NULL; }
+      s_card_timer = app_timer_register(80, card_flip_tick, NULL);
+      canvas_dirty();
     }
-    canvas_dirty();
+  } else if (s_state != STATE_LISTENING) {
+    // Start mode-toggle squish animation (if not already animating)
+    if (s_flip_phase < 0) {
+      s_flip_phase = 0;
+      if (s_flip_timer) { app_timer_cancel(s_flip_timer); s_flip_timer = NULL; }
+      s_flip_timer = app_timer_register(80, flip_tick, NULL);
+      canvas_dirty();
+    }
   }
 }
 static void btn_select(ClickRecognizerRef r, void *ctx) {
@@ -802,10 +996,14 @@ static void main_load(Window *w) {
 static void main_unload(Window *w) {
   cancel_watchdog();
   stop_wave();
-  if (s_face_path)  { gpath_destroy(s_face_path);            s_face_path  = NULL; }
-  if (s_dictation)  { dictation_session_destroy(s_dictation); s_dictation  = NULL; }
-  if (s_clock_tl)   { text_layer_destroy(s_clock_tl);         s_clock_tl   = NULL; }
-  if (s_canvas)     { layer_destroy(s_canvas);                 s_canvas     = NULL; }
+  if (s_flip_timer)  { app_timer_cancel(s_flip_timer);          s_flip_timer = NULL; }
+  if (s_card_timer)  { app_timer_cancel(s_card_timer);          s_card_timer = NULL; }
+  s_flip_phase = -1;
+  s_card_phase = -1;
+  if (s_face_path)  { gpath_destroy(s_face_path);              s_face_path  = NULL; }
+  if (s_dictation)  { dictation_session_destroy(s_dictation);  s_dictation  = NULL; }
+  if (s_clock_tl)   { text_layer_destroy(s_clock_tl);          s_clock_tl   = NULL; }
+  if (s_canvas)     { layer_destroy(s_canvas);                  s_canvas     = NULL; }
 }
 
 // ── App lifecycle ─────────────────────────────────────────────────────────
