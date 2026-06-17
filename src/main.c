@@ -17,6 +17,10 @@
 #define TRANSLATE_TIMEOUT_MS 20000
 #define WAVE_TIMER_MS        120
 #define LOG_MAX              10
+#define PERSIST_KEY_COUNT    100
+#define PERSIST_KEY_MONTH    101
+#define PERSIST_KEY_YEAR     102
+#define DICTATION_LIMIT      50
 
 typedef enum { STATE_HOME, STATE_LISTENING, STATE_RESULT } AppState;
 
@@ -36,6 +40,8 @@ static int               s_log_n    = 0;
 static AppTimer         *s_watchdog  = NULL;
 static AppTimer         *s_wave_timer = NULL;
 static int               s_wave_phase = 0;
+static int               s_remaining  = DICTATION_LIMIT;
+static char              s_count_buf[24];
 
 // ── Windows / layers ──────────────────────────────────────────────────────
 static Window           *s_win      = NULL;
@@ -77,6 +83,40 @@ static int    s_face_bot_y;            // y of face bottom (for prompt placement
 // ── Forward declarations ──────────────────────────────────────────────────
 static void start_dictation(void);
 static void send_translation_request(void);
+
+// ── Dictation count (persistent, resets each calendar month) ─────────────
+static void update_count_buf(void) {
+  // "後NN回可能"  U+5F8C後 U+56DE回 U+53EF可 U+80FD能
+  snprintf(s_count_buf, sizeof(s_count_buf),
+           "\xe5\xbe\x8c%d\xe5\x9b\x9e\xe5\x8f\xaf\xe8\x83\xbd", s_remaining);
+}
+static void load_dictation_count(void) {
+  time_t now = time(NULL);
+  struct tm *t = localtime(&now);
+  int cur_month = t->tm_mon;
+  int cur_year  = t->tm_year;
+  int saved_month = persist_exists(PERSIST_KEY_MONTH) ? persist_read_int(PERSIST_KEY_MONTH) : -1;
+  int saved_year  = persist_exists(PERSIST_KEY_YEAR)  ? persist_read_int(PERSIST_KEY_YEAR)  : -1;
+  if (saved_month != cur_month || saved_year != cur_year) {
+    persist_write_int(PERSIST_KEY_COUNT, 0);
+    persist_write_int(PERSIST_KEY_MONTH, cur_month);
+    persist_write_int(PERSIST_KEY_YEAR,  cur_year);
+    s_remaining = DICTATION_LIMIT;
+  } else {
+    int used = persist_exists(PERSIST_KEY_COUNT) ? persist_read_int(PERSIST_KEY_COUNT) : 0;
+    s_remaining = DICTATION_LIMIT - used;
+    if (s_remaining < 0) s_remaining = 0;
+  }
+  update_count_buf();
+}
+static void use_one_dictation(void) {
+  int used = persist_exists(PERSIST_KEY_COUNT) ? persist_read_int(PERSIST_KEY_COUNT) : 0;
+  used++;
+  persist_write_int(PERSIST_KEY_COUNT, used);
+  s_remaining = DICTATION_LIMIT - used;
+  if (s_remaining < 0) s_remaining = 0;
+  update_count_buf();
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 static void cancel_watchdog(void) {
@@ -127,16 +167,16 @@ static void build_layout(GRect bounds) {
   int W = bounds.size.w;
   int H = bounds.size.h;
 
-  // Face scale: smaller than the mockup so the prompt below stays readable
-  int face_h = H * 64 / 228;  // ~28% of H
+  // Face scale: 1.5× previous size — large and prominent
+  int face_h = H * 96 / 228;  // ~42% of H
   int sn = face_h;             // scale numerator
   int sd = 77;                 // scale denominator (SVG face height 22..99 = 77)
 
-  // Face center: horizontally centered; sits high so 18pt prompt fits below
+  // Face center: balanced to leave room for title above and prompt below
 #ifdef PBL_ROUND
-  int face_cy = H * 44 / 100;
+  int face_cy = H * 46 / 100;
 #else
-  int face_cy = H * 39 / 100;
+  int face_cy = H * 48 / 100;
 #endif
   int face_cx = W / 2;
 
@@ -188,10 +228,10 @@ static void draw_face(GContext *ctx) {
   graphics_context_set_fill_color(ctx,   GColorBlack);
 #endif
 
-  // Outline drawn 4× with (0,0),(1,0),(0,1),(1,1) offset for ~2px stroke
+  // Outline drawn 16× with (-1..2)×(-1..2) offsets for ~4px stroke (2× original)
   int dx, dy;
-  for (dx = 0; dx <= 1; dx++) {
-    for (dy = 0; dy <= 1; dy++) {
+  for (dx = -1; dx <= 2; dx++) {
+    for (dy = -1; dy <= 2; dy++) {
       gpath_move_to(s_face_path, GPoint(dx, dy));
       gpath_draw_outline(ctx, s_face_path);
     }
@@ -354,25 +394,24 @@ static void canvas_draw(Layer *layer, GContext *ctx) {
     return;
   }
 
-  // ── HOME / LISTENING: face + title + prompt ─────────────────────────────
+  // ── HOME / LISTENING: title + face + prompt ─────────────────────────────
   draw_face(ctx);
 
-  // "JP→EN" title  (U+2192 → = \xe2\x86\x92)
+  // App title: "Voice J to E" — full width, large font, top of screen
 #ifdef PBL_COLOR
   graphics_context_set_text_color(ctx, GColorWhite);
 #else
   graphics_context_set_text_color(ctx, GColorBlack);
 #endif
-  int title_y = H / 12;
 #ifdef PBL_ROUND
-  graphics_draw_text(ctx, "JP \xe2\x86\x92 EN",
+  graphics_draw_text(ctx, "Voice J to E",
     fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD),
-    GRect(W / 8, title_y, W * 6 / 8, 30),
+    GRect(W / 8, 4, W * 6 / 8, 30),
     GTextOverflowModeFill, GTextAlignmentCenter, NULL);
 #else
-  graphics_draw_text(ctx, "JP \xe2\x86\x92 EN",
+  graphics_draw_text(ctx, "Voice J to E",
     fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD),
-    GRect(0, title_y, W - 18, 30),
+    GRect(0, 2, W, 30),
     GTextOverflowModeFill, GTextAlignmentCenter, NULL);
 #endif
 
@@ -387,8 +426,6 @@ static void canvas_draw(Layer *layer, GContext *ctx) {
   int prompt_lm = 6;
   int prompt_w  = W - 38;
 #endif
-  int prompt_h  = H - prompt_y - H / 16;
-
 #ifdef PBL_COLOR
   graphics_context_set_text_color(ctx, GColorWhite);
 #else
@@ -425,15 +462,28 @@ static void canvas_draw(Layer *layer, GContext *ctx) {
                          1, GCornersAll);
     }
   } else {
-    // HOME prompt: "日本語で話しかけてください。"
+    // HOME prompt: "日本語で\n話して下さい" — 2 lines, larger bold font, centered
+    // 日本語で = \xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e\xe3\x81\xa7
+    // 話して   = \xe8\xa9\xb1\xe3\x81\x97\xe3\x81\xa6
+    // 下さい   = \xe4\xb8\x8b\xe3\x81\x95\xe3\x81\x84
     graphics_draw_text(ctx,
-      "\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e\xe3\x81\xa7"
-      "\xe8\xa9\xb1\xe3\x81\x97\xe3\x81\x8b\xe3\x81\x91"
-      "\xe3\x81\xa6\xe3\x81\x8f\xe3\x81\xa0\xe3\x81\x95"
-      "\xe3\x81\x84\xe3\x80\x82",
-      fonts_get_system_font(FONT_KEY_GOTHIC_18),
-      GRect(prompt_lm, prompt_y, prompt_w, prompt_h),
+      "\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e\xe3\x81\xa7\n"
+      "\xe8\xa9\xb1\xe3\x81\x97\xe3\x81\xa6\xe4\xb8\x8b"
+      "\xe3\x81\x95\xe3\x81\x84",
+      fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
+      GRect(prompt_lm, prompt_y, prompt_w, 44),
       GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
+
+    // Remaining dictation count at bottom: "後NN回可能"
+#ifdef PBL_COLOR
+    graphics_context_set_text_color(ctx, GColorWhite);
+#else
+    graphics_context_set_text_color(ctx, GColorBlack);
+#endif
+    graphics_draw_text(ctx, s_count_buf,
+      fonts_get_system_font(FONT_KEY_GOTHIC_14),
+      GRect(prompt_lm, H - 18, prompt_w, 16),
+      GTextOverflowModeFill, GTextAlignmentCenter, NULL);
   }
 }
 
@@ -552,6 +602,7 @@ static void dictation_cb(DictationSession *session,
   stop_wave();
   if (status == DictationSessionStatusSuccess) {
     snprintf(s_dictated, sizeof(s_dictated), "%s", transcription);
+    use_one_dictation();
     s_state = STATE_HOME;
     canvas_dirty();
     send_translation_request();
@@ -694,6 +745,7 @@ static void main_unload(Window *w) {
 
 // ── App lifecycle ─────────────────────────────────────────────────────────
 static void init(void) {
+  load_dictation_count();
   app_message_register_inbox_received(inbox_received);
   app_message_register_inbox_dropped(inbox_dropped);
   app_message_register_outbox_failed(outbox_failed);
