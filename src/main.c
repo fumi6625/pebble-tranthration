@@ -42,6 +42,8 @@ static AppTimer         *s_wave_timer = NULL;
 static int               s_wave_phase = 0;
 static int               s_remaining  = DICTATION_LIMIT;
 static char              s_count_buf[24];
+static bool              s_mode_ejp       = false; // false=JP→EN, true=EN→JP
+static bool              s_result_flipped = false; // 180° flip to show partner
 
 // ── Windows / layers ──────────────────────────────────────────────────────
 static Window           *s_win      = NULL;
@@ -184,37 +186,66 @@ static void build_layout(GRect bounds) {
   int ox = face_cx - 64 * sn / sd;
   int oy = face_cy - 60 * sn / sd;
 
-  // Build 20-point face outline
+  // Build 20-point face outline; flip x around screen centre in EN→JP mode
   s_face_bot_y = 0;
   for (int i = 0; i < 20; i++) {
-    s_face_pts[i].x = (int16_t)(SVG_FX[i] * sn / sd + ox);
+    int px = SVG_FX[i] * sn / sd + ox;
+    s_face_pts[i].x = (int16_t)(s_mode_ejp ? W - 1 - px : px);
     s_face_pts[i].y = (int16_t)(SVG_FY[i] * sn / sd + oy);
     if (s_face_pts[i].y > s_face_bot_y) s_face_bot_y = s_face_pts[i].y;
   }
 
-  // Eye: SVG (62, 48), r=3.8
-  s_eye_pos = GPoint(62 * sn / sd + ox, 48 * sn / sd + oy);
+// Flip x when in EN→JP mode so every feature mirrors the face
+#define FPX(v) (s_mode_ejp ? (W - 1 - (v)) : (v))
+
+  s_eye_pos = GPoint(FPX(62 * sn / sd + ox), 48 * sn / sd + oy);
   s_eye_r   = MAX(2, 4 * sn / sd);
 
-  // Mouth: SVG (42, 78), rx=7.5, ry=6.5
-  s_mouth_pos   = GPoint(42 * sn / sd + ox, 78 * sn / sd + oy);
+  s_mouth_pos   = GPoint(FPX(42 * sn / sd + ox), 78 * sn / sd + oy);
   s_mouth_r_out = MAX(4, 8 * sn / sd);
   s_mouth_r_in  = MAX(2, 4 * sn / sd);
 
-  // Sound wave sw1: M22,78 L15,78 (horizontal at mouth level)
-  s_sw1a = GPoint(22 * sn / sd + ox, 78 * sn / sd + oy);
-  s_sw1b = GPoint(15 * sn / sd + ox, 78 * sn / sd + oy);
-
-  // Sound wave sw2: M18,70 Q9,75 9,86 (quadratic bezier t=0.5 midpoint x=11,y=76)
-  s_sw2a = GPoint(18 * sn / sd + ox, 70 * sn / sd + oy);
-  s_sw2b = GPoint(11 * sn / sd + ox, 76 * sn / sd + oy);
-  s_sw2c = GPoint( 9 * sn / sd + ox, 86 * sn / sd + oy);
-
-  // Sound wave sw3: M15,62 Q4,71 5,93 (midpoint x=7,y=74)
-  s_sw3a = GPoint(15 * sn / sd + ox, 62 * sn / sd + oy);
-  s_sw3b = GPoint( 7 * sn / sd + ox, 74 * sn / sd + oy);
-  s_sw3c = GPoint( 5 * sn / sd + ox, 93 * sn / sd + oy);
+  s_sw1a = GPoint(FPX(22 * sn / sd + ox), 78 * sn / sd + oy);
+  s_sw1b = GPoint(FPX(15 * sn / sd + ox), 78 * sn / sd + oy);
+  s_sw2a = GPoint(FPX(18 * sn / sd + ox), 70 * sn / sd + oy);
+  s_sw2b = GPoint(FPX(11 * sn / sd + ox), 76 * sn / sd + oy);
+  s_sw2c = GPoint(FPX( 9 * sn / sd + ox), 86 * sn / sd + oy);
+  s_sw3a = GPoint(FPX(15 * sn / sd + ox), 62 * sn / sd + oy);
+  s_sw3b = GPoint(FPX( 7 * sn / sd + ox), 74 * sn / sd + oy);
+  s_sw3c = GPoint(FPX( 5 * sn / sd + ox), 93 * sn / sd + oy);
+#undef FPX
 }
+
+// ── 180° framebuffer rotation (swap pixel (x,y) ↔ (W-1-x, H-1-y)) ────────
+// Used to display the result flipped for the person across the table.
+// Color platforms only — B&W framebuffer is bit-packed and handled separately.
+#ifdef PBL_COLOR
+static void rotate_framebuffer_180(GContext *ctx) {
+  GBitmap *fb = graphics_capture_frame_buffer(ctx);
+  if (!fb) return;
+  GRect b    = gbitmap_get_bounds(fb);
+  int W      = b.size.w;
+  int H      = b.size.h;
+  int stride = gbitmap_get_bytes_per_row(fb);
+  uint8_t *data = (uint8_t *)gbitmap_get_data(fb);
+  for (int y = 0; y < H / 2; y++) {
+    uint8_t *top = data + y          * stride;
+    uint8_t *bot = data + (H-1-y)   * stride;
+    for (int x = 0; x < W; x++) {
+      uint8_t tmp      = top[x];
+      top[x]           = bot[W-1-x];
+      bot[W-1-x]       = tmp;
+    }
+  }
+  if (H & 1) {
+    uint8_t *mid = data + (H / 2) * stride;
+    for (int x = 0; x < W / 2; x++) {
+      uint8_t tmp = mid[x]; mid[x] = mid[W-1-x]; mid[W-1-x] = tmp;
+    }
+  }
+  graphics_release_frame_buffer(ctx, fb);
+}
+#endif
 
 // ── Draw face ─────────────────────────────────────────────────────────────
 static void draw_face(GContext *ctx) {
@@ -317,19 +348,20 @@ static const char *font_for_len(int len) {
 
 // ── Result screen: full-area, large, high-contrast translation ─────────────
 static void draw_result(GContext *ctx, int W, int H) {
-  // Small "JP → EN" header (clock sits top-right)
+  // Direction header — adapts to current mode
+  const char *hdr = s_mode_ejp ? "EN \xe2\x86\x92 JP" : "JP \xe2\x86\x92 EN";
 #ifdef PBL_COLOR
-  graphics_context_set_text_color(ctx, GColorWhite);
+  graphics_context_set_text_color(ctx, s_mode_ejp ? GColorBlack : GColorWhite);
 #else
   graphics_context_set_text_color(ctx, GColorBlack);
 #endif
 #ifdef PBL_ROUND
-  graphics_draw_text(ctx, "JP \xe2\x86\x92 EN",
+  graphics_draw_text(ctx, hdr,
     fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
     GRect(0, H / 20, W, 22),
     GTextOverflowModeFill, GTextAlignmentCenter, NULL);
 #else
-  graphics_draw_text(ctx, "JP \xe2\x86\x92 EN",
+  graphics_draw_text(ctx, hdr,
     fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
     GRect(8, 2, W - 60, 22),
     GTextOverflowModeFill, GTextAlignmentLeft, NULL);
@@ -379,9 +411,10 @@ static void canvas_draw(Layer *layer, GContext *ctx) {
   int W = b.size.w;
   int H = b.size.h;
 
-  // Background
+  // Background: sky-blue (JP→EN) / warm-orange (EN→JP)
 #ifdef PBL_COLOR
-  graphics_context_set_fill_color(ctx, GColorFromRGB(85, 170, 255));
+  graphics_context_set_fill_color(ctx,
+    s_mode_ejp ? GColorFromRGB(255, 160, 50) : GColorFromRGB(85, 170, 255));
 #else
   graphics_context_set_fill_color(ctx, GColorWhite);
 #endif
@@ -391,25 +424,29 @@ static void canvas_draw(Layer *layer, GContext *ctx) {
   if (s_state == STATE_RESULT && s_translated[0]) {
     draw_result(ctx, W, H);
     draw_right_labels(ctx, W, H);
+#ifdef PBL_COLOR
+    if (s_result_flipped) rotate_framebuffer_180(ctx);
+#endif
     return;
   }
 
   // ── HOME / LISTENING: title + face + prompt ─────────────────────────────
   draw_face(ctx);
 
-  // App title: "Voice J to E" — full width, large font, top of screen
+  // App title — adapts to current translation direction
+  const char *title_text = s_mode_ejp ? "Voice E to J" : "Voice J to E";
 #ifdef PBL_COLOR
-  graphics_context_set_text_color(ctx, GColorWhite);
+  graphics_context_set_text_color(ctx, s_mode_ejp ? GColorBlack : GColorWhite);
 #else
   graphics_context_set_text_color(ctx, GColorBlack);
 #endif
 #ifdef PBL_ROUND
-  graphics_draw_text(ctx, "Voice J to E",
+  graphics_draw_text(ctx, title_text,
     fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD),
     GRect(W / 8, 4, W * 6 / 8, 30),
     GTextOverflowModeFill, GTextAlignmentCenter, NULL);
 #else
-  graphics_draw_text(ctx, "Voice J to E",
+  graphics_draw_text(ctx, title_text,
     fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD),
     GRect(0, 2, W, 30),
     GTextOverflowModeFill, GTextAlignmentCenter, NULL);
@@ -462,21 +499,27 @@ static void canvas_draw(Layer *layer, GContext *ctx) {
                          1, GCornersAll);
     }
   } else {
-    // HOME prompt: "日本語で\n話して下さい" — 2 lines, larger bold font, centered
-    // 日本語で = \xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e\xe3\x81\xa7
-    // 話して   = \xe8\xa9\xb1\xe3\x81\x97\xe3\x81\xa6
-    // 下さい   = \xe4\xb8\x8b\xe3\x81\x95\xe3\x81\x84
-    graphics_draw_text(ctx,
-      "\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e\xe3\x81\xa7\n"
-      "\xe8\xa9\xb1\xe3\x81\x97\xe3\x81\xa6\xe4\xb8\x8b"
-      "\xe3\x81\x95\xe3\x81\x84",
-      fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
-      GRect(prompt_lm, prompt_y, prompt_w, 44),
-      GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
+    // HOME prompt — language depends on current mode
+    if (s_mode_ejp) {
+      // EN→JP mode: English prompt
+      graphics_draw_text(ctx, "Please speak\nin English",
+        fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
+        GRect(prompt_lm, prompt_y, prompt_w, 44),
+        GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
+    } else {
+      // JP→EN mode: "日本語で\n話して下さい"
+      graphics_draw_text(ctx,
+        "\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e\xe3\x81\xa7\n"
+        "\xe8\xa9\xb1\xe3\x81\x97\xe3\x81\xa6\xe4\xb8\x8b"
+        "\xe3\x81\x95\xe3\x81\x84",
+        fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
+        GRect(prompt_lm, prompt_y, prompt_w, 44),
+        GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
+    }
 
     // Remaining dictation count at bottom: "後NN回可能"
 #ifdef PBL_COLOR
-    graphics_context_set_text_color(ctx, GColorWhite);
+    graphics_context_set_text_color(ctx, s_mode_ejp ? GColorBlack : GColorWhite);
 #else
     graphics_context_set_text_color(ctx, GColorBlack);
 #endif
@@ -620,7 +663,7 @@ static void send_translation_request(void) {
   char safe[200];
   snprintf(safe, sizeof(safe), "%s", s_dictated);
   dict_write_cstring(iter, KEY_TEXT, safe);
-  dict_write_cstring(iter, KEY_LANG, "en");
+  dict_write_cstring(iter, KEY_LANG, s_mode_ejp ? "en|ja" : "ja|en");
   if (app_message_outbox_send() != APP_MSG_OK) return;
   s_watchdog = app_timer_register(TRANSLATE_TIMEOUT_MS, watchdog_cb, NULL);
 }
@@ -642,8 +685,29 @@ static void outbox_sent(DictionaryIterator *iter, void *ctx) {}
 
 // ── Buttons ───────────────────────────────────────────────────────────────
 static void btn_up(ClickRecognizerRef r, void *ctx) {
-  if (s_dictated[0] && s_state != STATE_LISTENING)
-    send_translation_request();
+  if (s_state == STATE_RESULT) {
+    // Flip result 180° so the person across the table can read it
+    s_result_flipped = !s_result_flipped;
+    canvas_dirty();
+  } else if (s_state != STATE_LISTENING) {
+    // Toggle translation direction JP→EN / EN→JP
+    s_mode_ejp       = !s_mode_ejp;
+    s_dictated[0]    = '\0';
+    s_translated[0]  = '\0';
+    s_result_flipped = false;
+    // Rebuild face GPath with new horizontal orientation
+    if (s_face_path) { gpath_destroy(s_face_path); s_face_path = NULL; }
+    build_layout(layer_get_bounds(window_get_root_layer(s_win)));
+    s_face_path = gpath_create(&s_face_info);
+    // Clock text colour: white on blue, black on orange
+    if (s_clock_tl) {
+#ifdef PBL_COLOR
+      text_layer_set_text_color(s_clock_tl,
+        s_mode_ejp ? GColorBlack : GColorWhite);
+#endif
+    }
+    canvas_dirty();
+  }
 }
 static void btn_select(ClickRecognizerRef r, void *ctx) {
   if (s_state == STATE_LISTENING) {
@@ -652,6 +716,7 @@ static void btn_select(ClickRecognizerRef r, void *ctx) {
     s_state = STATE_HOME;
     canvas_dirty();
   } else {
+    s_result_flipped = false;  // reset flip when starting fresh recording
     start_dictation();
   }
 }

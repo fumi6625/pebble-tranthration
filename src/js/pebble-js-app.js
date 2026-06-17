@@ -1,5 +1,6 @@
-// PebbleKit JS — Speech Translator
+// PebbleKit JS — Speech Translator (JP↔EN)
 var KEY_TEXT   = 0;
+var KEY_LANG   = 1;
 var KEY_RESULT = 2;
 
 function sendToWatch(text) {
@@ -13,13 +14,18 @@ function sendToWatch(text) {
   );
 }
 
-function translate(text, onResult) {
+// langpair examples: "ja|en" (JP→EN) or "en|ja" (EN→JP)
+function translate(text, langpair, onResult) {
+  var parts = (langpair || 'ja|en').split('|');
+  var sl = parts[0] || 'ja';
+  var tl = parts[1] || 'en';
   var url = 'https://translate.googleapis.com/translate_a/single' +
-            '?client=gtx&sl=ja&tl=en&dt=t&q=' + encodeURIComponent(text);
+            '?client=gtx&sl=' + sl + '&tl=' + tl +
+            '&dt=t&q=' + encodeURIComponent(text);
   console.log('SpeechTrans: GET ' + url);
 
   var xhr = new XMLHttpRequest();
-  xhr.open('GET', url, true);  // true = async (required in PebbleKit JS)
+  xhr.open('GET', url, true);
   xhr.onload = function(e) {
     console.log('SpeechTrans: readyState=' + this.readyState + ' status=' + this.status);
     if (this.readyState == 4) {
@@ -50,14 +56,18 @@ Pebble.addEventListener('appmessage', function(e) {
   console.log('SpeechTrans: appmessage ' + JSON.stringify(e.payload));
 
   var text = (e.payload['KEY_TEXT'] !== undefined) ? e.payload['KEY_TEXT'] : e.payload[KEY_TEXT];
-  console.log('SpeechTrans: text="' + text + '"');
+  var langpair = (e.payload['KEY_LANG'] !== undefined)
+    ? e.payload['KEY_LANG']
+    : (e.payload[KEY_LANG] || 'ja|en');
+
+  console.log('SpeechTrans: text="' + text + '" langpair="' + langpair + '"');
 
   if (!text) {
     sendToWatch('Error: no text');
     return;
   }
 
-  translate(text, function(result) {
+  translate(text, langpair, function(result) {
     console.log('SpeechTrans: result="' + result + '"');
     sendToWatch(result);
   });
