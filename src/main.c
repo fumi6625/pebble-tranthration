@@ -84,6 +84,7 @@ static GPoint s_sw3a, s_sw3b, s_sw3c; // sw3: wider arc
 static int    s_face_bot_y;            // y of face bottom (for prompt placement)
 
 // ── Forward declarations ──────────────────────────────────────────────────
+static void build_layout(GRect bounds);
 static void start_dictation(void);
 static void send_translation_request(void);
 static void flip_tick(void *ctx);
