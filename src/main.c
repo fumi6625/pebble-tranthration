@@ -17,10 +17,6 @@
 #define TRANSLATE_TIMEOUT_MS 20000
 #define WAVE_TIMER_MS        120
 #define LOG_MAX              10
-#define PERSIST_KEY_COUNT    100
-#define PERSIST_KEY_MONTH    101
-#define PERSIST_KEY_YEAR     102
-#define DICTATION_LIMIT      50
 
 typedef enum { STATE_HOME, STATE_LISTENING, STATE_RESULT } AppState;
 
@@ -40,8 +36,6 @@ static int               s_log_n    = 0;
 static AppTimer         *s_watchdog  = NULL;
 static AppTimer         *s_wave_timer = NULL;
 static int               s_wave_phase = 0;
-static int               s_remaining  = DICTATION_LIMIT;
-static char              s_count_buf[24];
 static bool              s_mode_ejp       = false; // false=JP→EN, true=EN→JP
 static bool              s_result_flipped = false; // 180° flip to show partner
 static int               s_flip_phase  = -1;       // -1=off; 0-7=mode-toggle squish anim
@@ -96,43 +90,6 @@ static void flip_tick(void *ctx);
 static void card_flip_tick(void *ctx);
 
 // ── Dictation count (persistent, resets each calendar month) ─────────────
-static void update_count_buf(void) {
-  if (s_mode_ejp) {
-    snprintf(s_count_buf, sizeof(s_count_buf), "%d left/month", s_remaining);
-  } else {
-    // "後NN回可能"
-    snprintf(s_count_buf, sizeof(s_count_buf),
-             "\xe5\xbe\x8c%d\xe5\x9b\x9e\xe5\x8f\xaf\xe8\x83\xbd", s_remaining);
-  }
-}
-static void load_dictation_count(void) {
-  time_t now = time(NULL);
-  struct tm *t = localtime(&now);
-  int cur_month = t->tm_mon;
-  int cur_year  = t->tm_year;
-  int saved_month = persist_exists(PERSIST_KEY_MONTH) ? persist_read_int(PERSIST_KEY_MONTH) : -1;
-  int saved_year  = persist_exists(PERSIST_KEY_YEAR)  ? persist_read_int(PERSIST_KEY_YEAR)  : -1;
-  if (saved_month != cur_month || saved_year != cur_year) {
-    persist_write_int(PERSIST_KEY_COUNT, 0);
-    persist_write_int(PERSIST_KEY_MONTH, cur_month);
-    persist_write_int(PERSIST_KEY_YEAR,  cur_year);
-    s_remaining = DICTATION_LIMIT;
-  } else {
-    int used = persist_exists(PERSIST_KEY_COUNT) ? persist_read_int(PERSIST_KEY_COUNT) : 0;
-    s_remaining = DICTATION_LIMIT - used;
-    if (s_remaining < 0) s_remaining = 0;
-  }
-  update_count_buf();
-}
-static void use_one_dictation(void) {
-  int used = persist_exists(PERSIST_KEY_COUNT) ? persist_read_int(PERSIST_KEY_COUNT) : 0;
-  used++;
-  persist_write_int(PERSIST_KEY_COUNT, used);
-  s_remaining = DICTATION_LIMIT - used;
-  if (s_remaining < 0) s_remaining = 0;
-  update_count_buf();
-}
-
 // ── Helpers ───────────────────────────────────────────────────────────────
 static void cancel_watchdog(void) {
   if (s_watchdog) { app_timer_cancel(s_watchdog); s_watchdog = NULL; }
@@ -196,7 +153,6 @@ static void flip_tick(void *context) {
         s_mode_ejp ? GColorBlack : GColorWhite);
 #endif
     }
-    update_count_buf();
   }
   canvas_dirty();
   if (s_flip_phase < 7) {
@@ -714,17 +670,6 @@ static void canvas_draw(Layer *layer, GContext *ctx) {
         GRect(prompt_lm, prompt_y, prompt_w, prompt_h),
         GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
     }
-
-    // Remaining count — GOTHIC_18_BOLD (~2× GOTHIC_14)
-#ifdef PBL_COLOR
-    graphics_context_set_text_color(ctx, s_mode_ejp ? GColorBlack : GColorWhite);
-#else
-    graphics_context_set_text_color(ctx, GColorBlack);
-#endif
-    graphics_draw_text(ctx, s_count_buf,
-      fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
-      GRect(prompt_lm, H - 26, prompt_w, 24),
-      GTextOverflowModeFill, GTextAlignmentCenter, NULL);
   }
   #undef SQX
   #undef SQW
@@ -845,7 +790,6 @@ static void dictation_cb(DictationSession *session,
   stop_wave();
   if (status == DictationSessionStatusSuccess) {
     snprintf(s_dictated, sizeof(s_dictated), "%s", transcription);
-    use_one_dictation();
     s_state = STATE_HOME;
     canvas_dirty();
     send_translation_request();
@@ -1008,7 +952,6 @@ static void main_unload(Window *w) {
 
 // ── App lifecycle ─────────────────────────────────────────────────────────
 static void init(void) {
-  load_dictation_count();
   app_message_register_inbox_received(inbox_received);
   app_message_register_inbox_dropped(inbox_dropped);
   app_message_register_outbox_failed(outbox_failed);
