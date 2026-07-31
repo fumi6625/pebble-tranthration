@@ -1,10 +1,10 @@
 #include <pebble.h>
 
-// ── Platform screen sizes ─────────────────────────────────────────────────
-// basalt  (Pebble Time/Steel):       144×168, color, rect
-// chalk   (Pebble Time Round):       180×180, color, round
-// diorite (Pebble 2 / 2 SE):         144×168, B&W,   rect
-// emery   (Pebble Time 2):           200×228, color, rect
+// ── Target platform ───────────────────────────────────────────────────────
+// emery (Pebble Time 2): 200×228, colour, rect. Sole supported platform.
+// Screen is ~200 ppi (0.126 mm/px), so text sizing follows:
+//   body text >= 16 px (2 mm); absolute floor 14 px (~1.8 mm).
+//   GOTHIC_14 is therefore the smallest font used anywhere.
 
 #ifndef MAX
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
@@ -17,6 +17,23 @@
 #define TRANSLATE_TIMEOUT_MS 20000
 #define WAVE_TIMER_MS        120
 #define LOG_MAX              10
+
+// ── Layout constants (emery 200×228) ──────────────────────────────────────
+#define STATUS_H   24    // top status bar height
+#define RAIL_W     34    // right-edge button rail width
+#define CHIP       26    // rail chip (icon button) size
+
+// ── Colour system ─────────────────────────────────────────────────────────
+#define COL_BG_JPEN   GColorFromRGB( 85, 170, 255)  // sky blue   (JP→EN)
+#define COL_BG_ENJP   GColorFromRGB(255, 160,  50)  // warm orange(EN→JP)
+#define COL_BAR_JPEN  GColorFromRGB(  0,  85, 170)  // status bar / chips
+#define COL_BAR_ENJP  GColorFromRGB(180,  95,   0)
+#define COL_INK       GColorFromRGB(  0,  40,  90)  // text on white cards
+#define COL_ACCENT    GColorFromRGB(  0, 110, 200)  // timestamps, hint pill
+
+// Current-mode colour helpers
+#define BG_COL()   (s_mode_ejp ? COL_BG_ENJP  : COL_BG_JPEN)
+#define BAR_COL()  (s_mode_ejp ? COL_BAR_ENJP : COL_BAR_JPEN)
 
 typedef enum { STATE_HOME, STATE_LISTENING, STATE_RESULT } AppState;
 
@@ -49,7 +66,6 @@ static const uint8_t CARD_SQ[6] = {75, 40, 10, 10, 40, 75};
 // ── Windows / layers ──────────────────────────────────────────────────────
 static Window           *s_win      = NULL;
 static Layer            *s_canvas   = NULL;
-static TextLayer        *s_clock_tl = NULL;
 static Window           *s_logwin   = NULL;
 static Layer            *s_logcanv  = NULL;
 static DictationSession *s_dictation = NULL;
@@ -114,10 +130,12 @@ static void add_to_log(const char *orig, const char *trans) {
 }
 
 // ── Tick handler ──────────────────────────────────────────────────────────
+// The clock lives in the status bar, so a new minute just redraws the canvas.
 static void tick_handler(struct tm *tick_time, TimeUnits units_changed) {
   snprintf(s_clock_buf, sizeof(s_clock_buf),
            "%02d:%02d", tick_time->tm_hour, tick_time->tm_min);
-  if (s_clock_tl) text_layer_set_text(s_clock_tl, s_clock_buf);
+  canvas_dirty();
+  if (s_logcanv) layer_mark_dirty(s_logcanv);
 }
 
 // ── Wave animation ────────────────────────────────────────────────────────
@@ -148,12 +166,6 @@ static void flip_tick(void *context) {
     if (s_face_path) { gpath_destroy(s_face_path); s_face_path = NULL; }
     build_layout(layer_get_bounds(window_get_root_layer(s_win)));
     s_face_path = gpath_create(&s_face_info);
-    if (s_clock_tl) {
-#ifdef PBL_COLOR
-      text_layer_set_text_color(s_clock_tl,
-        s_mode_ejp ? GColorBlack : GColorWhite);
-#endif
-    }
   }
   canvas_dirty();
   if (s_flip_phase < 7) {
@@ -185,40 +197,37 @@ static void card_flip_tick(void *context) {
 }
 
 // ── Layout builder ────────────────────────────────────────────────────────
-// Called once in main_load to compute all positions from actual screen bounds.
-// Scales the SVG face to 37% of screen height, centered on screen.
+// Called from main_load (and on every mode toggle) to compute face geometry.
+// The face is centred in the *content* area — i.e. the screen minus the right
+// button rail — and sits between the status bar and the prompt text.
 static void build_layout(GRect bounds) {
   int W = bounds.size.w;
   int H = bounds.size.h;
 
-  // Face scale: 1.5× previous size — large and prominent
-  int face_h = H * 96 / 228;  // ~42% of H
+  int face_h = H * 88 / 228;  // 88 px on emery
   int sn = face_h;             // scale numerator
   int sd = 77;                 // scale denominator (SVG face height 22..99 = 77)
 
-  // Face center: balanced to leave room for title above and prompt below
-#ifdef PBL_ROUND
-  int face_cy = H * 46 / 100;
-#else
-  int face_cy = H * 40 / 100;
-#endif
-  int face_cx = W / 2;
+  // Vertically: 36% down the area below the status bar.
+  // Horizontally: centre of the content area (screen minus the rail).
+  int face_cy = STATUS_H + (H - STATUS_H) * 36 / 100;
+  int face_cx = (W - RAIL_W) / 2;
 
   // Offset so SVG center (64, 60) maps to (face_cx, face_cy)
   int ox = face_cx - 64 * sn / sd;
   int oy = face_cy - 60 * sn / sd;
 
-  // Build 20-point face outline; flip x around screen centre in EN→JP mode
+  // Build 20-point face outline; mirror about the content centre in EN→JP mode
   s_face_bot_y = 0;
   for (int i = 0; i < 20; i++) {
     int px = SVG_FX[i] * sn / sd + ox;
-    s_face_pts[i].x = (int16_t)(s_mode_ejp ? W - 1 - px : px);
+    s_face_pts[i].x = (int16_t)(s_mode_ejp ? 2 * face_cx - px : px);
     s_face_pts[i].y = (int16_t)(SVG_FY[i] * sn / sd + oy);
     if (s_face_pts[i].y > s_face_bot_y) s_face_bot_y = s_face_pts[i].y;
   }
 
-// Flip x when in EN→JP mode so every feature mirrors the face
-#define FPX(v) (s_mode_ejp ? (W - 1 - (v)) : (v))
+// Mirror x about the content centre so every feature follows the face
+#define FPX(v) (s_mode_ejp ? (2 * face_cx - (v)) : (v))
 
   s_eye_pos = GPoint(FPX(62 * sn / sd + ox), 48 * sn / sd + oy);
   s_eye_r   = MAX(2, 4 * sn / sd);
@@ -239,9 +248,7 @@ static void build_layout(GRect bounds) {
 }
 
 // ── 180° rotation of a rectangular region only ────────────────────────────
-// Rotates pixels within `region` only — buttons/clock outside are untouched.
-// Color platforms only (B&W bit-packed framebuffer not supported).
-#ifdef PBL_COLOR
+// Rotates pixels within `region` only — status bar and rail stay upright.
 static void rotate_region_180(GContext *ctx, GRect region) {
   GBitmap *fb = graphics_capture_frame_buffer(ctx);
   if (!fb) return;
@@ -279,50 +286,166 @@ static void rotate_region_180(GContext *ctx, GRect region) {
   }
   graphics_release_frame_buffer(ctx, fb);
 }
-#endif
 
-// ── 360° rotation-arrow hint near the UP button ───────────────────────────
-// Draws a circular arrow (arc + arrowhead) on the right edge near the top,
-// indicating that the UP button cycles translation mode.
-static void draw_rotate_hint(GContext *ctx, int W, int H) {
-#ifdef PBL_COLOR
-  graphics_context_set_stroke_color(ctx, GColorWhite);
-  graphics_context_set_fill_color(ctx, GColorWhite);
-#else
-  graphics_context_set_stroke_color(ctx, GColorBlack);
-  graphics_context_set_fill_color(ctx, GColorBlack);
-#endif
+// ── Button icons ──────────────────────────────────────────────────────────
+// Drawn with primitives rather than glyphs: the system font has no reliable
+// coverage for ↻ ⇅ ☰, and vector icons stay crisp at any chip size.
+typedef enum { ICON_ROTATE, ICON_REC, ICON_STOP, ICON_LIST, ICON_FLIP } IconKind;
 
-#ifdef PBL_ROUND
-  int cx = W - W * 18 / 100;
-  int cy = H * 14 / 100 + 10;
-  int r  = H * 7 / 100;
-#else
-  int cx = W - 18;
-  int cy = H * 11 / 100 + 10;
-  int r  = 10;
-#endif
+static void draw_icon(GContext *ctx, IconKind kind, int cx, int cy, GColor c) {
+  graphics_context_set_stroke_color(ctx, c);
+  graphics_context_set_fill_color(ctx, c);
 
-  // Draw arc ~300° (leaving a gap at the top-right where the arrowhead goes)
-  graphics_context_set_stroke_width(ctx, 2);
-  graphics_draw_arc(ctx, GRect(cx - r, cy - r, r * 2, r * 2),
-                    GOvalScaleModeFitCircle,
-                    DEG_TO_TRIGANGLE(30), DEG_TO_TRIGANGLE(330));
-
-  // Arrowhead at the end of the arc (near 330°) pointing clockwise
-  // 330° on unit circle: cos=-0.866, sin=-0.5
-  int ax = cx + r * 87 / 100;   // cos(30°)≈0.866
-  int ay = cy - r * 50 / 100;   // sin(30°)≈0.5 (above center)
-  GPoint tip = GPoint(ax, ay);
-  GPoint p1  = GPoint(ax - 4, ay - 5);
-  GPoint p2  = GPoint(ax + 3, ay - 5);
-  GPoint pts[3] = { tip, p1, p2 };
-  const GPathInfo arrow_info = { .num_points = 3, .points = pts };
-  GPath *arrow = gpath_create(&arrow_info);
-  if (arrow) {
-    gpath_draw_filled(ctx, arrow);
-    gpath_destroy(arrow);
+  switch (kind) {
+    case ICON_ROTATE: {          // circular arrow — switch direction
+      int r = 7;
+      graphics_context_set_stroke_width(ctx, 2);
+      graphics_draw_arc(ctx, GRect(cx - r, cy - r, r * 2, r * 2),
+                        GOvalScaleModeFitCircle,
+                        DEG_TO_TRIGANGLE(40), DEG_TO_TRIGANGLE(330));
+      graphics_context_set_stroke_width(ctx, 1);
+      // arrowhead closing the gap at the arc's 40° end (upper right)
+      GPoint pts[3] = { GPoint(cx + 8, cy - 8),
+                        GPoint(cx,     cy - 6),
+                        GPoint(cx + 6, cy     ) };
+      GPathInfo info = { .num_points = 3, .points = pts };
+      GPath *p = gpath_create(&info);
+      if (p) { gpath_draw_filled(ctx, p); gpath_destroy(p); }
+      break;
+    }
+    case ICON_REC:               // filled dot — start recording
+      graphics_fill_circle(ctx, GPoint(cx, cy), 6);
+      break;
+    case ICON_STOP:              // filled square — stop recording
+      graphics_fill_rect(ctx, GRect(cx - 5, cy - 5, 11, 11), 1, GCornersAll);
+      break;
+    case ICON_LIST:              // three bars — history
+      for (int i = -1; i <= 1; i++) {
+        graphics_fill_rect(ctx, GRect(cx - 7, cy + i * 5 - 1, 15, 3),
+                           1, GCornersAll);
+      }
+      break;
+    case ICON_FLIP: {            // up + down triangles — flip the card
+      GPoint up[3]   = { GPoint(cx, cy - 8), GPoint(cx - 5, cy - 2),
+                         GPoint(cx + 5, cy - 2) };
+      GPoint down[3] = { GPoint(cx, cy + 8), GPoint(cx - 5, cy + 2),
+                         GPoint(cx + 5, cy + 2) };
+      GPathInfo iu = { .num_points = 3, .points = up };
+      GPathInfo id = { .num_points = 3, .points = down };
+      GPath *a = gpath_create(&iu);
+      GPath *b = gpath_create(&id);
+      if (a) { gpath_draw_filled(ctx, a); gpath_destroy(a); }
+      if (b) { gpath_draw_filled(ctx, b); gpath_destroy(b); }
+      break;
+    }
   }
+}
+
+// ── Top status bar: direction badge + clock ───────────────────────────────
+// Shared by every screen so the translation direction never depends on the
+// background colour alone. `badge` is the pill text (e.g. "JP → EN").
+static void draw_status_bar(GContext *ctx, int W, const char *badge) {
+  graphics_context_set_fill_color(ctx, BAR_COL());
+  graphics_fill_rect(ctx, GRect(0, 0, W, STATUS_H), 0, GCornerNone);
+
+  // White pill with the direction, sized to the text
+  GFont bf = fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD);
+  GSize bs = graphics_text_layout_get_content_size(badge, bf,
+    GRect(0, 0, W, STATUS_H), GTextOverflowModeFill, GTextAlignmentLeft);
+  int pill_w = bs.w + 14;
+  int pill_h = 20;
+  int pill_y = (STATUS_H - pill_h) / 2;
+  graphics_context_set_fill_color(ctx, GColorWhite);
+  graphics_fill_rect(ctx, GRect(4, pill_y, pill_w, pill_h), 5, GCornersAll);
+
+  graphics_context_set_text_color(ctx, COL_INK);
+  graphics_draw_text(ctx, badge, bf,
+    GRect(4, pill_y - 2, pill_w, pill_h + 2),
+    GTextOverflowModeFill, GTextAlignmentCenter, NULL);
+
+  // Clock, right-aligned
+  graphics_context_set_text_color(ctx, GColorWhite);
+  graphics_draw_text(ctx, s_clock_buf,
+    fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
+    GRect(W - 60, pill_y - 2, 56, pill_h + 2),
+    GTextOverflowModeFill, GTextAlignmentRight, NULL);
+}
+
+// ── Right-edge button rail ────────────────────────────────────────────────
+// One chip per physical button, at that button's height, so UP / SELECT /
+// DOWN read at a glance. Icon carries the meaning; the label confirms it.
+static void draw_rail_chip(GContext *ctx, int W, int cy,
+                           IconKind kind, const char *label, GColor icon_col) {
+  // Centred so the wider label box below still lands inside the screen
+  int cx = W - RAIL_W / 2 - 1;
+
+  graphics_context_set_fill_color(ctx, BAR_COL());
+  graphics_fill_rect(ctx, GRect(cx - CHIP / 2, cy - CHIP / 2, CHIP, CHIP),
+                     6, GCornersAll);
+  graphics_context_set_stroke_color(ctx, GColorWhite);
+  graphics_draw_round_rect(ctx, GRect(cx - CHIP / 2, cy - CHIP / 2, CHIP, CHIP), 6);
+
+  draw_icon(ctx, kind, cx, cy, icon_col);
+
+  graphics_context_set_text_color(ctx, GColorWhite);
+  graphics_draw_text(ctx, label,
+    fonts_get_system_font(FONT_KEY_GOTHIC_14),
+    GRect(cx - RAIL_W / 2, cy + CHIP / 2 - 1, RAIL_W, 18),
+    GTextOverflowModeFill, GTextAlignmentCenter, NULL);
+}
+
+// Rail contents depend on the current screen.
+static void draw_rail(GContext *ctx, int W, int H) {
+  int up_y = STATUS_H + 18;
+  int sel_y = H / 2;
+  int dn_y = H * 82 / 100;
+
+  if (s_state == STATE_LISTENING) {
+    // Mode switch is unavailable mid-recording — show it muted.
+    draw_rail_chip(ctx, W, up_y,  ICON_ROTATE, "",
+                   GColorFromRGB(170, 170, 170));
+    draw_rail_chip(ctx, W, sel_y, ICON_STOP, "\xe5\x81\x9c\xe6\xad\xa2",   // 停止
+                   GColorRed);
+  } else if (s_state == STATE_RESULT && s_translated[0]) {
+    draw_rail_chip(ctx, W, up_y,  ICON_FLIP, "\xe5\x8f\x8d\xe8\xbb\xa2",   // 反転
+                   GColorWhite);
+    draw_rail_chip(ctx, W, sel_y, ICON_REC, "\xe9\x8c\xb2\xe9\x9f\xb3",    // 録音
+                   GColorRed);
+  } else {
+    draw_rail_chip(ctx, W, up_y,  ICON_ROTATE, "\xe5\x88\x87\xe6\x9b\xbf", // 切替
+                   GColorWhite);
+    draw_rail_chip(ctx, W, sel_y, ICON_REC, "\xe9\x8c\xb2\xe9\x9f\xb3",    // 録音
+                   GColorRed);
+  }
+
+  draw_rail_chip(ctx, W, dn_y, ICON_LIST, "\xe5\xb1\xa5\xe6\xad\xb4",      // 履歴
+                 GColorWhite);
+}
+
+// Badge text for the current translation direction
+static const char *direction_badge(void) {
+  return s_mode_ejp ? "EN \xe2\x86\x92 JP" : "JP \xe2\x86\x92 EN";
+}
+
+// ── Microphone glyph inside a ring (recording screen focal point) ─────────
+static void draw_mic(GContext *ctx, int cx, int cy, int r) {
+  graphics_context_set_stroke_color(ctx, GColorWhite);
+  graphics_context_set_stroke_width(ctx, 3);
+  graphics_draw_circle(ctx, GPoint(cx, cy), r);
+  graphics_context_set_stroke_width(ctx, 1);
+
+  int bw = r * 4 / 9;          // capsule width
+  int bh = r;                  // capsule height
+  graphics_context_set_fill_color(ctx, GColorWhite);
+  graphics_fill_rect(ctx, GRect(cx - bw / 2, cy - bh * 3 / 5, bw, bh),
+                     bw / 2, GCornersAll);
+
+  // Cradle under the capsule, plus a short stem
+  graphics_context_set_stroke_width(ctx, 2);
+  graphics_draw_arc(ctx,
+    GRect(cx - bw, cy - bh / 4, bw * 2, bh * 3 / 4 + 4),
+    GOvalScaleModeFitCircle, DEG_TO_TRIGANGLE(90), DEG_TO_TRIGANGLE(270));
+  graphics_draw_line(ctx, GPoint(cx, cy + bh / 2), GPoint(cx, cy + bh * 4 / 5));
   graphics_context_set_stroke_width(ctx, 1);
 }
 
@@ -330,13 +453,8 @@ static void draw_rotate_hint(GContext *ctx, int W, int H) {
 static void draw_face(GContext *ctx) {
   if (!s_face_path) return;
 
-#ifdef PBL_COLOR
   graphics_context_set_stroke_color(ctx, GColorYellow);
   graphics_context_set_fill_color(ctx,   GColorYellow);
-#else
-  graphics_context_set_stroke_color(ctx, GColorBlack);
-  graphics_context_set_fill_color(ctx,   GColorBlack);
-#endif
 
   // Outline drawn 16× with (-1..2)×(-1..2) offsets for ~4px stroke (2× original)
   int dx, dy;
@@ -351,22 +469,14 @@ static void draw_face(GContext *ctx) {
   // Eye
   graphics_fill_circle(ctx, s_eye_pos, s_eye_r);
 
-  // Mouth: yellow outer ring, blue inner fill (open-mouth effect)
+  // Mouth: yellow outer ring, darker inner fill (open-mouth effect)
   graphics_fill_circle(ctx, s_mouth_pos, s_mouth_r_out);
-#ifdef PBL_COLOR
-  graphics_context_set_fill_color(ctx, GColorFromRGB(0, 85, 170));
-#else
-  graphics_context_set_fill_color(ctx, GColorWhite);
-#endif
+  graphics_context_set_fill_color(ctx, BAR_COL());
   graphics_fill_circle(ctx, s_mouth_pos, s_mouth_r_in);
 
   // Sound waves visible only when listening
   if (s_state != STATE_LISTENING) return;
-#ifdef PBL_COLOR
   graphics_context_set_stroke_color(ctx, GColorYellow);
-#else
-  graphics_context_set_stroke_color(ctx, GColorBlack);
-#endif
   // sw1: horizontal line at mouth height
   graphics_draw_line(ctx, s_sw1a, s_sw1b);
   // sw2: arc downward
@@ -377,95 +487,22 @@ static void draw_face(GContext *ctx) {
   graphics_draw_line(ctx, s_sw3b, s_sw3c);
 }
 
-// ── Right-edge action labels (REC / LOG) ──────────────────────────────────
-// SELECT = REC/STP (vertical center), DOWN = LOG (lower). Drawn in all states.
-static void draw_right_labels(GContext *ctx, int W, int H) {
-#ifdef PBL_ROUND
-  int lx = W - W * 22 / 100;   // inset from the curved right edge
-  int lw = W * 20 / 100;
-  int rec_y = H / 2 - 24;
-  int log_y = H / 2 + 4;
-#else
-  int lx = W - 32;
-  int lw = 30;
-  int rec_y = H / 2 - 10;
-  int log_y = H * 80 / 100;
-#endif
-
-  // REC (or STP while listening)
-#ifdef PBL_COLOR
-  if (s_state == STATE_LISTENING) {
-    graphics_context_set_text_color(ctx, GColorWhite);
-  } else {
-    graphics_context_set_text_color(ctx,
-      s_mode_ejp ? GColorFromRGB(150, 0, 0) : GColorRed);
-  }
-#else
-  graphics_context_set_text_color(ctx, GColorBlack);
-#endif
-  graphics_draw_text(ctx,
-    (s_state == STATE_LISTENING) ? "STP" : "REC",
-    fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
-    GRect(lx, rec_y, lw, 22),
-    GTextOverflowModeFill, GTextAlignmentRight, NULL);
-
-  // LOG
-#ifdef PBL_COLOR
-  graphics_context_set_text_color(ctx, s_mode_ejp ? GColorBlack : GColorWhite);
-#else
-  graphics_context_set_text_color(ctx, GColorBlack);
-#endif
-  graphics_draw_text(ctx, "LOG",
-    fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD),
-    GRect(lx, log_y, lw, 20),
-    GTextOverflowModeFill, GTextAlignmentRight, NULL);
-}
-
 // ── Pick the largest readable font that suits the text length ──────────────
+// Floor is GOTHIC_18 (18 px ≈ 2.3 mm) so even long results stay readable.
 static const char *font_for_len(int len) {
   if (len <= 18)  return FONT_KEY_GOTHIC_28_BOLD;
-  if (len <= 40)  return FONT_KEY_GOTHIC_24_BOLD;
-  if (len <= 90)  return FONT_KEY_GOTHIC_18_BOLD;
-  return FONT_KEY_GOTHIC_14_BOLD;
+  if (len <= 45)  return FONT_KEY_GOTHIC_24_BOLD;
+  return FONT_KEY_GOTHIC_18_BOLD;
 }
 
-// ── Result screen: full-area, large, high-contrast translation ─────────────
+// ── Result screen: one big white card holding the translation ─────────────
 static void draw_result(GContext *ctx, int W, int H) {
-  // Direction header — adapts to current mode
-  const char *hdr = s_mode_ejp ? "EN \xe2\x86\x92 JP" : "JP \xe2\x86\x92 EN";
-#ifdef PBL_COLOR
-  graphics_context_set_text_color(ctx, s_mode_ejp ? GColorBlack : GColorWhite);
-#else
-  graphics_context_set_text_color(ctx, GColorBlack);
-#endif
-#ifdef PBL_ROUND
-  graphics_draw_text(ctx, hdr,
-    fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
-    GRect(0, H / 20, W, 22),
-    GTextOverflowModeFill, GTextAlignmentCenter, NULL);
-#else
-  graphics_draw_text(ctx, hdr,
-    fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
-    GRect(8, 2, W - 60, 22),
-    GTextOverflowModeFill, GTextAlignmentLeft, NULL);
-#endif
+  int card_x = 5;
+  int card_y = STATUS_H + 4;
+  int card_w = W - card_x - RAIL_W;
+  int card_h = H - card_y - 6;
 
-  // Card region (leaves room for the right-edge REC/LOG labels)
-#ifdef PBL_ROUND
-  int top = H / 5;
-  int lm  = W / 7;
-  int rm  = W / 7;
-#else
-  int top = H / 7;
-  int lm  = 6;
-  int rm  = 36;
-#endif
-  int card_x = lm;
-  int card_y = top;
-  int card_w = W - lm - rm;
-  int card_h = H - top - H / 16;
-
-  // Apply card squish during animation: scale x around card centre
+  // Apply card squish during the flip animation: scale x about the card centre
   int sq_pct = (s_card_phase >= 0 && s_card_phase < 6)
                ? CARD_SQ[s_card_phase] : 100;
   if (sq_pct < 100) {
@@ -478,17 +515,13 @@ static void draw_result(GContext *ctx, int W, int H) {
 
   GFont font = fonts_get_system_font(font_for_len((int)strlen(s_translated)));
   GRect card_rect = GRect(card_x, card_y, card_w, card_h);
-  GRect pad  = GRect(card_x + 5, card_y + 4, card_w - 10, card_h - 8);
+  GRect pad = GRect(card_x + 6, card_y + 6, card_w - 12, card_h - 12);
 
-#ifdef PBL_COLOR
   graphics_context_set_fill_color(ctx, GColorWhite);
-  graphics_fill_rect(ctx, card_rect, 6, GCornersAll);
-  graphics_context_set_text_color(ctx, GColorFromRGB(0, 40, 90));
-#else
-  graphics_context_set_text_color(ctx, GColorBlack);
-#endif
+  graphics_fill_rect(ctx, card_rect, 9, GCornersAll);
 
   if (sq_pct >= 20 && pad.size.w > 10) {
+    graphics_context_set_text_color(ctx, COL_INK);
     GSize ts = graphics_text_layout_get_content_size(s_translated, font,
       pad, GTextOverflowModeWordWrap, GTextAlignmentCenter);
     int ty = pad.origin.y;
@@ -498,12 +531,25 @@ static void draw_result(GContext *ctx, int W, int H) {
       GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
   }
 
-  // After drawing the card, rotate only the card region if flipped
-#ifdef PBL_COLOR
+  // Rotate the card — and only the card — when showing it to the other person
   if (s_result_flipped && sq_pct >= 95) {
     rotate_region_180(ctx, card_rect);
   }
-#endif
+
+  // Flip affordance, drawn after the rotation so it always reads upright
+  if (sq_pct >= 95) {
+    int pw = 50, ph = 18;
+    int px = card_x + card_w - pw - 6;
+    int py = card_y + 6;
+    graphics_context_set_fill_color(ctx, COL_ACCENT);
+    graphics_fill_rect(ctx, GRect(px, py, pw, ph), 5, GCornersAll);
+    draw_icon(ctx, ICON_FLIP, px + 11, py + ph / 2, GColorWhite);
+    graphics_context_set_text_color(ctx, GColorWhite);
+    graphics_draw_text(ctx, "\xe5\x8f\x8d\xe8\xbb\xa2",   // 反転
+      fonts_get_system_font(FONT_KEY_GOTHIC_14),
+      GRect(px + 20, py - 1, pw - 22, ph),
+      GTextOverflowModeFill, GTextAlignmentLeft, NULL);
+  }
 }
 
 // ── Main canvas ───────────────────────────────────────────────────────────
@@ -512,130 +558,41 @@ static void canvas_draw(Layer *layer, GContext *ctx) {
   int W = b.size.w;
   int H = b.size.h;
 
-  // Squish factor for mode-toggle animation (100=full, 0=collapsed)
+  // Squish factor for the mode-toggle animation (100 = full, 0 = collapsed)
   int sq_pct = (s_flip_phase >= 0 && s_flip_phase < 8)
                ? FLIP_SQ[s_flip_phase] : 100;
 
   // Background: sky-blue (JP→EN) / warm-orange (EN→JP)
-#ifdef PBL_COLOR
-  graphics_context_set_fill_color(ctx,
-    s_mode_ejp ? GColorFromRGB(255, 160, 50) : GColorFromRGB(85, 170, 255));
-#else
-  graphics_context_set_fill_color(ctx, GColorWhite);
-#endif
+  graphics_context_set_fill_color(ctx, BG_COL());
   graphics_fill_rect(ctx, b, 0, GCornerNone);
 
-  // During squish: draw a vertical stripe narrower than full width
-  if (sq_pct < 100) {
-    int mid = W / 2;
-    int hw  = W / 2 * sq_pct / 100;
-    // Reveal background colour outside the stripe (already filled above)
-    // Draw the content stripe clipped — we use a narrowed version of all rects
-    // by offsetting x toward centre and reducing widths by (1 - sq_pct/100).
-    // Implemented below by adjusting all draw positions proportionally.
-    (void)mid; (void)hw; // positions computed per-element below
-  }
-
-  // Helper macro: squish an x-coordinate toward screen centre
-  // sq_pct=100 → identity; sq_pct=0 → all x collapse to W/2
-  #define SQX(x) (W/2 + ((x) - W/2) * sq_pct / 100)
+  // Content is centred in the screen minus the button rail; the flip
+  // animation squishes x about that centre, not the screen centre.
+  int cc = (W - RAIL_W) / 2;
+  #define SQX(x) (cc + ((x) - cc) * sq_pct / 100)
   #define SQW(w) ((w) * sq_pct / 100)
 
-  // ── RESULT: dedicate the whole screen to the readable translation ───────
+  // ── RESULT: one big card with the translation ───────────────────────────
   if (s_state == STATE_RESULT && s_translated[0]) {
+    draw_status_bar(ctx, W, direction_badge());
     draw_result(ctx, W, H);
-    draw_right_labels(ctx, W, H);
+    draw_rail(ctx, W, H);
     return;
   }
 
-  // ── HOME / LISTENING: title + face + prompt ─────────────────────────────
-
-  // Draw face (uses precomputed s_face_pts which are already squished via build_layout;
-  // during flip animation we manually squish the gpath points inline)
-  if (sq_pct < 100 && s_face_path) {
-    // Temporarily squish face points
-    GPoint tmp_pts[20];
-    for (int i = 0; i < 20; i++) {
-      tmp_pts[i].x = (int16_t)SQX(s_face_pts[i].x);
-      tmp_pts[i].y = s_face_pts[i].y;
-    }
-    GPathInfo tmp_info = { .num_points = 20, .points = tmp_pts };
-    GPath *tmp_path = gpath_create(&tmp_info);
-    if (tmp_path) {
-      GPath *saved = s_face_path;
-      s_face_path = tmp_path;
-      draw_face(ctx);
-      s_face_path = saved;
-      gpath_destroy(tmp_path);
-    }
-  } else {
-    draw_face(ctx);
-  }
-
-  // App title
-  const char *title_text = s_mode_ejp ? "Voice E to J" : "Voice J to E";
-#ifdef PBL_COLOR
-  graphics_context_set_text_color(ctx, s_mode_ejp ? GColorBlack : GColorWhite);
-#else
-  graphics_context_set_text_color(ctx, GColorBlack);
-#endif
-  {
-#ifdef PBL_ROUND
-    int tx = SQX(W / 8), tw = SQW(W * 6 / 8);
-    if (tw < 4) tw = 4;
-    graphics_draw_text(ctx, title_text,
-      fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD),
-      GRect(tx, 4, tw, 30),
-      GTextOverflowModeFill, GTextAlignmentCenter, NULL);
-#else
-    int tx = SQX(0), tw = SQW(W);
-    if (tw < 4) tw = 4;
-    graphics_draw_text(ctx, title_text,
-      fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD),
-      GRect(tx, 2, tw, 30),
-      GTextOverflowModeFill, GTextAlignmentCenter, NULL);
-#endif
-  }
-
-  draw_right_labels(ctx, W, H);
-
-  // Rotation hint (↻) near UP button — only on HOME, not animating
-  if (s_state == STATE_HOME && sq_pct == 100) {
-    draw_rotate_hint(ctx, W, H);
-  }
-
-  // ── Prompt / listening text ────────────────────────────────────────────
-  int prompt_y  = s_face_bot_y + H / 28;
-  // Larger font for the prompt (~2× GOTHIC_18)
-  const char *prompt_font = (H > 200)
-    ? FONT_KEY_GOTHIC_28_BOLD : FONT_KEY_GOTHIC_24_BOLD;
-  int prompt_h = (H > 200) ? 70 : 60;
-
-#ifdef PBL_ROUND
-  int prompt_lm = SQX(W / 8);
-  int prompt_w  = SQW(W * 6 / 8);
-#else
-  int prompt_lm = SQX(6);
-  int prompt_w  = SQW(W - 38);
-#endif
-  if (prompt_w < 4) prompt_w = 4;
-
-#ifdef PBL_COLOR
-  graphics_context_set_text_color(ctx, GColorWhite);
-#else
-  graphics_context_set_text_color(ctx, GColorBlack);
-#endif
-
   if (s_state == STATE_LISTENING) {
-    // "聞き取り中…"
+    // ── LISTENING: mic, status text, and the animated level meter ─────────
+    int mic_cy = STATUS_H + (H - STATUS_H) * 30 / 100;
+    draw_mic(ctx, cc, mic_cy, 24);
+
+    graphics_context_set_text_color(ctx, GColorWhite);
     graphics_draw_text(ctx,
-      "\xe8\x81\x9e\xe3\x81\x8d\xe5\x8f\x96\xe3\x82\x8a"
-      "\xe4\xb8\xad\xe2\x80\xa6",
+      "\xe8\x81\x9e\xe3\x81\x8d\xe5\x8f\x96\xe3\x82\x8a"      // 聞き取り
+      "\xe4\xb8\xad\xe2\x80\xa6",                              // 中…
       fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD),
-      GRect(prompt_lm, prompt_y, prompt_w, H / 8),
+      GRect(4, mic_cy + 34, W - RAIL_W - 8, 34),
       GTextOverflowModeFill, GTextAlignmentCenter, NULL);
 
-    // Animated wave bars
     static const int8_t wh[4][13] = {
       { 5, 8,12,16,20,22,20,16,12, 8, 5, 4, 3},
       { 3, 5, 8,14,20,22,20,14, 8, 5, 3, 5, 8},
@@ -643,35 +600,54 @@ static void canvas_draw(Layer *layer, GContext *ctx) {
       { 4, 7,12,18,22,20,16,12, 7, 5, 8,12,16},
     };
     int bar_total = 13 * 7 - 3;
-    int x0 = (W - bar_total) / 2;
-    int bar_base = H - H / 14;
-#ifdef PBL_COLOR
+    int x0 = cc - bar_total / 2;
+    int bar_base = H - 18;
     graphics_context_set_fill_color(ctx, GColorWhite);
-#else
-    graphics_context_set_fill_color(ctx, GColorBlack);
-#endif
     for (int i = 0; i < 13; i++) {
       int h = wh[s_wave_phase][i];
       graphics_fill_rect(ctx, GRect(x0 + i * 7, bar_base - h, 4, h),
                          1, GCornersAll);
     }
   } else {
-    // HOME prompt
-    if (s_mode_ejp) {
-      graphics_draw_text(ctx, "Please speak\nin English",
-        fonts_get_system_font(prompt_font),
-        GRect(prompt_lm, prompt_y, prompt_w, prompt_h),
-        GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
+    // ── HOME: face + prompt ───────────────────────────────────────────────
+    if (sq_pct < 100 && s_face_path) {
+      // Squish the face outline in place for the flip animation
+      GPoint tmp_pts[20];
+      for (int i = 0; i < 20; i++) {
+        tmp_pts[i].x = (int16_t)SQX(s_face_pts[i].x);
+        tmp_pts[i].y = s_face_pts[i].y;
+      }
+      GPathInfo tmp_info = { .num_points = 20, .points = tmp_pts };
+      GPath *tmp_path = gpath_create(&tmp_info);
+      if (tmp_path) {
+        GPath *saved = s_face_path;
+        s_face_path = tmp_path;
+        draw_face(ctx);
+        s_face_path = saved;
+        gpath_destroy(tmp_path);
+      }
     } else {
-      graphics_draw_text(ctx,
-        "\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e\xe3\x81\xa7\n"
-        "\xe8\xa9\xb1\xe3\x81\x97\xe3\x81\xa6\xe4\xb8\x8b"
-        "\xe3\x81\x95\xe3\x81\x84",
-        fonts_get_system_font(prompt_font),
-        GRect(prompt_lm, prompt_y, prompt_w, prompt_h),
-        GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
+      draw_face(ctx);
     }
+
+    int prompt_x = SQX(4);
+    int prompt_w = SQW(W - RAIL_W - 8);
+    if (prompt_w < 4) prompt_w = 4;
+
+    graphics_context_set_text_color(ctx, GColorWhite);
+    graphics_draw_text(ctx,
+      s_mode_ejp ? "Please speak\nin English"
+                 : "\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e\xe3\x81\xa7\n"  // 日本語で
+                   "\xe8\xa9\xb1\xe3\x81\x97\xe3\x81\xa6\xe4\xb8\x8b"    // 話して下
+                   "\xe3\x81\x95\xe3\x81\x84",                            // さい
+      fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD),
+      GRect(prompt_x, s_face_bot_y + 6, prompt_w, 70),
+      GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
   }
+
+  draw_status_bar(ctx, W, direction_badge());
+  draw_rail(ctx, W, H);
+
   #undef SQX
   #undef SQW
 }
@@ -682,94 +658,42 @@ static void log_canvas_draw(Layer *layer, GContext *ctx) {
   int W = b.size.w;
   int H = b.size.h;
 
-#ifdef PBL_COLOR
-  graphics_context_set_fill_color(ctx, GColorFromRGB(85, 170, 255));
-#else
-  graphics_context_set_fill_color(ctx, GColorWhite);
-#endif
+  graphics_context_set_fill_color(ctx, BG_COL());
   graphics_fill_rect(ctx, b, 0, GCornerNone);
 
-  // Header bar
-  int hdr_h = H / 8;
-#ifdef PBL_COLOR
-  graphics_context_set_fill_color(ctx, GColorFromRGB(0, 85, 170));
-#else
-  graphics_context_set_fill_color(ctx, GColorBlack);
-#endif
-  graphics_fill_rect(ctx, GRect(0, 0, W, hdr_h), 0, GCornerNone);
-
-  int hdr_font_y = hdr_h / 2 - 9;
-#ifdef PBL_COLOR
-  graphics_context_set_text_color(ctx, GColorBlack);
-#else
-  graphics_context_set_text_color(ctx, GColorWhite);
-#endif
-  graphics_draw_text(ctx, "LOG",
-    fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
-    GRect(8, hdr_font_y, 50, 22),
-    GTextOverflowModeFill, GTextAlignmentLeft, NULL);
-
-  // "直近10件" — \x91 followed by "10" needs string split
-#ifdef PBL_COLOR
-  graphics_context_set_text_color(ctx, GColorFromRGB(170, 220, 255));
-#else
-  graphics_context_set_text_color(ctx, GColorWhite);
-#endif
-  graphics_draw_text(ctx,
-    "\xe7\x9b\xb4\xe8\xbf\x91" "10\xe4\xbb\xb6",
-    fonts_get_system_font(FONT_KEY_GOTHIC_14),
-    GRect(W - 62, hdr_font_y + 3, 58, 16),
-    GTextOverflowModeFill, GTextAlignmentRight, NULL);
+  // Same status bar as every other screen, badged "履歴"
+  draw_status_bar(ctx, W, "\xe5\xb1\xa5\xe6\xad\xb4");
 
   if (s_log_n == 0) {
-#ifdef PBL_COLOR
     graphics_context_set_text_color(ctx, GColorWhite);
-#else
-    graphics_context_set_text_color(ctx, GColorBlack);
-#endif
     graphics_draw_text(ctx, "No history yet",
-      fonts_get_system_font(FONT_KEY_GOTHIC_14),
-      GRect(8, hdr_h + 8, W - 16, 20),
+      fonts_get_system_font(FONT_KEY_GOTHIC_18),
+      GRect(10, STATUS_H + 10, W - 20, 26),
       GTextOverflowModeFill, GTextAlignmentLeft, NULL);
     return;
   }
 
-  // Each card shows a bold timestamp + the English translation, large & legible.
-  // (The recognized Japanese is mostly kanji, which the system font can't
-  //  render, so the card focuses on the readable English result.)
-  int card_h   = H * 56 / 168;
-  int card_gap = H * 6 / 168;
-  int lm = W > 160 ? 10 : 6;
-  int y  = hdr_h + 4;
+  // Cards show the timestamp plus the translation — the recognised source is
+  // mostly kanji, so the readable result is what earns the space.
+  int lm       = 6;
+  int card_h   = (H - STATUS_H - 18) / 2;
+  int card_gap = 6;
+  int y        = STATUS_H + 6;
 
   for (int i = 0; i < s_log_n && y + card_h <= H; i++) {
-#ifdef PBL_COLOR
     graphics_context_set_fill_color(ctx, GColorWhite);
-#else
-    graphics_context_set_fill_color(ctx, GColorWhite);
-#endif
-    graphics_fill_rect(ctx, GRect(lm, y, W - lm*2, card_h), 5, GCornersAll);
+    graphics_fill_rect(ctx, GRect(lm, y, W - lm * 2, card_h), 8, GCornersAll);
 
-    // Timestamp (top-left, accent color)
-#ifdef PBL_COLOR
-    graphics_context_set_text_color(ctx, GColorFromRGB(0, 110, 200));
-#else
-    graphics_context_set_text_color(ctx, GColorBlack);
-#endif
+    graphics_context_set_text_color(ctx, COL_ACCENT);
     graphics_draw_text(ctx, s_log[i].timestamp,
-      fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD),
-      GRect(lm+6, y+3, 48, 16),
+      fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
+      GRect(lm + 8, y + 3, 60, 22),
       GTextOverflowModeFill, GTextAlignmentLeft, NULL);
 
-    // English translation — the main content, large and high-contrast
-#ifdef PBL_COLOR
-    graphics_context_set_text_color(ctx, GColorFromRGB(0, 40, 90));
-#else
-    graphics_context_set_text_color(ctx, GColorBlack);
-#endif
+    graphics_context_set_text_color(ctx, COL_INK);
     graphics_draw_text(ctx, s_log[i].translated,
       fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
-      GRect(lm+6, y + 20, W - lm*2 - 12, card_h - 24),
+      GRect(lm + 8, y + 24, W - lm * 2 - 16, card_h - 28),
       GTextOverflowModeWordWrap, GTextAlignmentLeft, NULL);
 
     y += card_h + card_gap;
@@ -895,7 +819,6 @@ static void log_clicks(void *ctx) {
 static void main_load(Window *w) {
   Layer *root   = window_get_root_layer(w);
   GRect bounds  = layer_get_bounds(root);
-  int   W       = bounds.size.w;
 
   // Build face path and all element positions for this screen size
   build_layout(bounds);
@@ -904,33 +827,9 @@ static void main_load(Window *w) {
   layer_set_update_proc(s_canvas, canvas_draw);
   layer_add_child(root, s_canvas);
 
-  // Clock TextLayer — top-right on rect, top-center on round
-#ifdef PBL_ROUND
-  int H = bounds.size.h;
-  GRect clock_frame = GRect(W/2 - 24, H/20, 48, 14);
-#else
-  GRect clock_frame = GRect(W - 50, 1, 48, 14);
-#endif
-
   time_t now = time(NULL);
   struct tm *t = localtime(&now);
   snprintf(s_clock_buf, sizeof(s_clock_buf), "%02d:%02d", t->tm_hour, t->tm_min);
-
-  s_clock_tl = text_layer_create(clock_frame);
-  text_layer_set_background_color(s_clock_tl, GColorClear);
-#ifdef PBL_COLOR
-  text_layer_set_text_color(s_clock_tl, GColorWhite);
-#else
-  text_layer_set_text_color(s_clock_tl, GColorBlack);
-#endif
-  text_layer_set_font(s_clock_tl, fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD));
-#ifdef PBL_ROUND
-  text_layer_set_text_alignment(s_clock_tl, GTextAlignmentCenter);
-#else
-  text_layer_set_text_alignment(s_clock_tl, GTextAlignmentRight);
-#endif
-  text_layer_set_text(s_clock_tl, s_clock_buf);
-  layer_add_child(root, text_layer_get_layer(s_clock_tl));
 
   s_face_path = gpath_create(&s_face_info);
   s_dictation = dictation_session_create(sizeof(s_dictated), dictation_cb, NULL);
@@ -945,7 +844,6 @@ static void main_unload(Window *w) {
   s_card_phase = -1;
   if (s_face_path)  { gpath_destroy(s_face_path);              s_face_path  = NULL; }
   if (s_dictation)  { dictation_session_destroy(s_dictation);  s_dictation  = NULL; }
-  if (s_clock_tl)   { text_layer_destroy(s_clock_tl);          s_clock_tl   = NULL; }
   if (s_canvas)     { layer_destroy(s_canvas);                  s_canvas     = NULL; }
 }
 

@@ -5,7 +5,7 @@
   "companyName": "zefuru",
   "versionLabel": "1.1",
   "sdkVersion": "3",
-  "targetPlatforms": ["basalt", "chalk", "diorite", "emery"],
+  "targetPlatforms": ["emery"],
   "watchapp": {
     "watchface": false
   },

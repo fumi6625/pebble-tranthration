@@ -1,28 +1,38 @@
 #!/usr/bin/env python3
-"""Generate Pebble app store / CloudPebble image assets."""
+"""Generate Pebble app store / CloudPebble image assets (emery 200x228).
+
+The screenshot renderer mirrors the layout maths in src/main.c so the store
+images stay in step with what the watch actually draws.
+"""
 
 from PIL import Image, ImageDraw, ImageFont
 import math, os
 
-# ── SVG face data (from main.c) ───────────────────────────────────────────
+# ── SVG face data (identical to SVG_FX/SVG_FY in main.c) ──────────────────
 SVG_FX = [70,81,88,94,96,97,96,92,87,80,70,54,43,40,47,32,47,49,53,61]
 SVG_FY = [22,26,33,41,51,61,71,80,87,93,98,99,93,84,73,62,53,41,31,24]
-# SVG face bounding box: x 32-97, y 22-99  centre ≈ (64, 60)
 
-# ── Colour palette ────────────────────────────────────────────────────────
-BLUE   = (85, 170, 255)
-ORANGE = (255, 160,  50)
-YELLOW = (255, 215,   0)
-NAVY   = ( 0,  40,  90)
-WHITE  = (255, 255, 255)
-BLACK  = (  0,   0,   0)
-RED    = (200,   0,   0)
-DARK_RED=(120,   0,   0)
-SKY_LIGHT=(130, 200, 255)
+# ── Layout constants (must match main.c) ──────────────────────────────────
+W, H      = 200, 228
+STATUS_H  = 24
+RAIL_W    = 34
+CHIP      = 26
 
-# ── Font paths ────────────────────────────────────────────────────────────
+# ── Colour system (must match main.c) ─────────────────────────────────────
+BG_JPEN   = ( 85, 170, 255)
+BG_ENJP   = (255, 160,  50)
+BAR_JPEN  = (  0,  85, 170)
+BAR_ENJP  = (180,  95,   0)
+INK       = (  0,  40,  90)
+ACCENT    = (  0, 110, 200)
+YELLOW    = (255, 255,   0)
+WHITE     = (255, 255, 255)
+BLACK     = (  0,   0,   0)
+RED       = (255,   0,   0)
+
 FONT_JP   = "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf"
 FONT_SANS = "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"
+
 
 def load_font(path, size):
     try:
@@ -30,224 +40,294 @@ def load_font(path, size):
     except Exception:
         return ImageFont.load_default()
 
-# ── Face geometry helpers ─────────────────────────────────────────────────
-def face_pts(W, H, face_pct=96, cy_pct=40, mirror=False):
-    """Compute scaled face polygon, eye, mouth positions."""
-    sn  = H * face_pct // 228   # match main.c formula  H*96/228
-    sd  = 77
-    cyx = H * cy_pct // 100
-    cxx = W // 2
-    ox  = cxx - 64 * sn // sd
-    oy  = cyx - 60 * sn // sd
 
-    pts = []
-    bot = 0
-    for i in range(20):
-        px = SVG_FX[i] * sn // sd + ox
-        py = SVG_FY[i] * sn // sd + oy
-        if mirror:
-            px = W - 1 - px
-        pts.append((px, py))
-        if py > bot:
-            bot = py
+def text_w(draw, s, font):
+    try:
+        bb = draw.textbbox((0, 0), s, font=font)
+        return bb[2] - bb[0]
+    except Exception:
+        return len(s) * font.size // 2
+
+
+def centre_text(draw, s, font, x, y, w, fill):
+    draw.text((x + (w - text_w(draw, s, font)) // 2, y), s, font=font, fill=fill)
+
+
+# ── Face ──────────────────────────────────────────────────────────────────
+def face_geometry(mirror):
+    """Return (polygon, eye, mouth, bottom_y) exactly as build_layout does."""
+    sn, sd  = H * 88 // 228, 77
+    face_cy = STATUS_H + (H - STATUS_H) * 36 // 100
+    face_cx = (W - RAIL_W) // 2
+    ox = face_cx - 64 * sn // sd
+    oy = face_cy - 60 * sn // sd
 
     def fx(v):
         x = v * sn // sd + ox
-        return (W - 1 - x) if mirror else x
+        return (2 * face_cx - x) if mirror else x
+
     def fy(v):
         return v * sn // sd + oy
 
-    eye    = (fx(62), fy(48), max(2, 4*sn//sd))
-    mouth  = (fx(42), fy(78), max(4, 8*sn//sd), max(2, 4*sn//sd))
+    pts, bot = [], 0
+    for i in range(20):
+        px, py = fx(SVG_FX[i]), fy(SVG_FY[i])
+        pts.append((px, py))
+        bot = max(bot, py)
+
+    eye   = (fx(62), fy(48), max(2, 4 * sn // sd))
+    mouth = (fx(42), fy(78), max(4, 8 * sn // sd), max(2, 4 * sn // sd))
     return pts, eye, mouth, bot
 
-def face_pts_icon(W, H, fill_pct=75, mirror=False):
-    """Compute face geometry for square icon (custom scale)."""
-    sn  = H * fill_pct // 100   # fill ~75% of height
-    sd  = 77
-    cyx = H * 47 // 100
-    cxx = W // 2
-    ox  = cxx - 64 * sn // sd
-    oy  = cyx - 60 * sn // sd
 
-    pts = []
-    for i in range(20):
-        px = SVG_FX[i] * sn // sd + ox
-        py = SVG_FY[i] * sn // sd + oy
-        if mirror:
-            px = W - 1 - px
-        pts.append((px, py))
-
-    def fx(v):
-        x = v * sn // sd + ox
-        return (W - 1 - x) if mirror else x
-    def fy(v):
-        return v * sn // sd + oy
-
-    eye   = (fx(62), fy(48), max(2, 4*sn//sd))
-    mouth = (fx(42), fy(78), max(4, 8*sn//sd), max(2, 4*sn//sd))
-    return pts, eye, mouth
-
-# ── Face drawing ──────────────────────────────────────────────────────────
-def draw_face(draw, pts, eye, mouth, stroke_col, stroke_w=2, mouth_fill=NAVY):
-    """Draw the profile face: thick outline, eye dot, open-mouth ring."""
-    # Outline (draw multiple offsets for thick stroke)
-    for dx in range(-stroke_w+1, stroke_w+1):
-        for dy in range(-stroke_w+1, stroke_w+1):
-            shifted = [(x+dx, y+dy) for x,y in pts]
-            draw.polygon(shifted, outline=stroke_col)
-
+def draw_face(d, mirror, mouth_fill):
+    pts, eye, mouth, _ = face_geometry(mirror)
+    for dx in range(-1, 3):
+        for dy in range(-1, 3):
+            d.polygon([(x + dx, y + dy) for x, y in pts], outline=YELLOW)
     ex, ey, er = eye
-    draw.ellipse((ex-er, ey-er, ex+er, ey+er), fill=stroke_col)
+    d.ellipse((ex - er, ey - er, ex + er, ey + er), fill=YELLOW)
+    mx, my, ro, ri = mouth
+    d.ellipse((mx - ro, my - ro, mx + ro, my + ro), fill=YELLOW)
+    d.ellipse((mx - ri, my - ri, mx + ri, my + ri), fill=mouth_fill)
 
-    mx, my, mr_out, mr_in = mouth
-    draw.ellipse((mx-mr_out, my-mr_out, mx+mr_out, my+mr_out), fill=stroke_col)
-    draw.ellipse((mx-mr_in,  my-mr_in,  mx+mr_in,  my+mr_in),  fill=mouth_fill)
 
-# ── 1. MENU IMAGE (25×25, black-on-white, high contrast) ─────────────────
-def make_menu_image(path="assets/menu_image.png"):
-    W, H = 25, 25
-    img  = Image.new("RGB", (W, H), WHITE)
-    draw = ImageDraw.Draw(img)
+# ── Chrome: status bar and button rail ────────────────────────────────────
+def draw_status_bar(d, badge, bar_col, clock="12:04"):
+    d.rectangle((0, 0, W, STATUS_H), fill=bar_col)
+    f = load_font(FONT_JP, 18)
+    pill_w = text_w(d, badge, f) + 14
+    pill_h = 20
+    py = (STATUS_H - pill_h) // 2
+    d.rounded_rectangle((4, py, 4 + pill_w, py + pill_h), radius=5, fill=WHITE)
+    centre_text(d, badge, f, 4, py - 1, pill_w, INK)
+    fc = load_font(FONT_SANS, 18)
+    d.text((W - 4 - text_w(d, clock, fc), py - 1), clock, font=fc, fill=WHITE)
 
-    # Small face — tight fill_pct to fit 25×25
-    sn, sd = 18, 77
-    cyx = 11
-    cxx = 12
-    ox  = cxx - 64 * sn // sd
-    oy  = cyx - 60 * sn // sd
 
-    pts = []
-    for i in range(20):
-        px = SVG_FX[i] * sn // sd + ox
-        py = SVG_FY[i] * sn // sd + oy
-        pts.append((px, py))
+def draw_icon(d, kind, cx, cy, col):
+    if kind == "rotate":
+        r = 7
+        d.arc((cx - r, cy - r, cx + r, cy + r), start=-50, end=240,
+              fill=col, width=2)
+        d.polygon([(cx + 8, cy - 8), (cx, cy - 6), (cx + 6, cy)], fill=col)
+    elif kind == "rec":
+        d.ellipse((cx - 6, cy - 6, cx + 6, cy + 6), fill=col)
+    elif kind == "stop":
+        d.rounded_rectangle((cx - 5, cy - 5, cx + 5, cy + 5), radius=1, fill=col)
+    elif kind == "list":
+        for i in (-1, 0, 1):
+            d.rounded_rectangle((cx - 7, cy + i * 5 - 1, cx + 7, cy + i * 5 + 1),
+                                radius=1, fill=col)
+    elif kind == "flip":
+        d.polygon([(cx, cy - 8), (cx - 5, cy - 2), (cx + 5, cy - 2)], fill=col)
+        d.polygon([(cx, cy + 8), (cx - 5, cy + 2), (cx + 5, cy + 2)], fill=col)
 
-    # Filled solid black for maximum contrast on white
-    draw.polygon(pts, fill=BLACK, outline=BLACK)
 
-    # Eye (white dot punched in)
-    ex = 62 * sn // sd + ox
-    ey = 48 * sn // sd + oy
-    er = max(1, 1)
-    draw.ellipse((ex-er, ey-er, ex+er, ey+er), fill=WHITE)
+def draw_rail_chip(d, cy, kind, label, icon_col, bar_col):
+    cx = W - RAIL_W // 2 - 1
+    box = (cx - CHIP // 2, cy - CHIP // 2, cx + CHIP // 2, cy + CHIP // 2)
+    d.rounded_rectangle(box, radius=6, fill=bar_col, outline=WHITE)
+    draw_icon(d, kind, cx, cy, icon_col)
+    if label:
+        f = load_font(FONT_JP, 14)
+        centre_text(d, label, f, cx - RAIL_W // 2, cy + CHIP // 2 - 1, RAIL_W, WHITE)
 
-    img.save(path)
-    print(f"  Saved {path}")
 
-# ── 2 & 3. Icon (80×80 and 144×144, colour) ──────────────────────────────
-def make_icon(size, path):
-    W = H = size
-    img  = Image.new("RGB", (W, H), BLUE)
-    draw = ImageDraw.Draw(img)
-
-    # Rounded square blue background
-    r = size // 8
-    draw.rounded_rectangle((0, 0, W-1, H-1), radius=r, fill=BLUE)
-
-    pts, eye, mouth = face_pts_icon(W, H, fill_pct=72)
-    sw = max(1, size // 40)
-    draw_face(draw, pts, eye, mouth,
-              stroke_col=YELLOW, stroke_w=sw, mouth_fill=NAVY)
-
-    # Small "J→E" label at bottom
-    fsize = max(8, size // 12)
-    font  = load_font(FONT_SANS, fsize)
-    label = "J→E"
-    try:
-        bb = draw.textbbox((0,0), label, font=font)
-        tw = bb[2]-bb[0]
-    except Exception:
-        tw = fsize * len(label) // 2
-    draw.text(((W-tw)//2, H - fsize - size//14), label, font=font, fill=WHITE)
-
-    img.save(path)
-    print(f"  Saved {path}")
-
-# ── 4 & 5. Home screen screenshots (200×228) ─────────────────────────────
-def make_screenshot(mode_ejp, path):
-    W, H = 200, 228
-    bg   = ORANGE if mode_ejp else BLUE
-    fg   = BLACK  if mode_ejp else WHITE
-
-    img  = Image.new("RGB", (W, H), bg)
-    draw = ImageDraw.Draw(img)
-
-    # ── Title bar ──────────────────────────────────────────────────────
-    title  = "Voice E to J" if mode_ejp else "Voice J to E"
-    f_title = load_font(FONT_SANS, 18)
-    try:
-        bb = draw.textbbox((0,0), title, font=f_title)
-        tw = bb[2]-bb[0]
-    except Exception:
-        tw = 18 * len(title) // 2
-    draw.text(((W-tw)//2, 4), title, font=f_title, fill=fg)
-
-    # ── Clock (top-right) ─────────────────────────────────────────────
-    f_clock = load_font(FONT_SANS, 11)
-    draw.text((W-46, 2), "12:00", font=f_clock, fill=fg)
-
-    # ── Face ──────────────────────────────────────────────────────────
-    pts, eye, mouth, bot_y = face_pts(W, H, face_pct=96, cy_pct=40, mirror=mode_ejp)
-    sw = 3
-    mouth_fill = (0, 85, 170) if not mode_ejp else (140, 70, 0)
-    draw_face(draw, pts, eye, mouth,
-              stroke_col=YELLOW, stroke_w=sw, mouth_fill=mouth_fill)
-
-    # ── Right edge labels ─────────────────────────────────────────────
-    f_lbl = load_font(FONT_SANS, 13)
-    rec_col = DARK_RED if mode_ejp else RED
-    draw.text((W-32, H//2-12), "REC", font=f_lbl, fill=rec_col)
-    draw.text((W-32, int(H*0.80)), "LOG", font=f_lbl, fill=fg)
-
-    # ── Rotation hint (arc + arrowhead near top-right) ───────────────
-    cx, cy, r = W-18, H*11//100, 10
-    draw.arc((cx-r, cy-r, cx+r, cy+r), start=30, end=330,
-             fill=fg, width=2)
-    # Arrowhead
-    ax = cx + int(r * math.cos(math.radians(30)))
-    ay = cy - int(r * math.sin(math.radians(30)))
-    draw.polygon([(ax,ay),(ax-4,ay-5),(ax+3,ay-5)], fill=fg)
-
-    # ── Prompt text ───────────────────────────────────────────────────
-    prompt_y = bot_y + H // 28
-    lm, pw   = 6, W - 38
-
-    if mode_ejp:
-        f_prompt = load_font(FONT_SANS, 20)
-        lines = ["Please speak", "in English"]
-        for i, line in enumerate(lines):
-            try:
-                bb = draw.textbbox((0,0), line, font=f_prompt)
-                tw = bb[2]-bb[0]
-            except Exception:
-                tw = 20 * len(line) // 2
-            draw.text((lm + (pw-tw)//2, prompt_y + i*26), line,
-                      font=f_prompt, fill=fg)
+def draw_rail(d, state, bar_col):
+    up_y, sel_y, dn_y = STATUS_H + 18, H // 2, H * 82 // 100
+    if state == "listening":
+        draw_rail_chip(d, up_y,  "rotate", "",   (170, 170, 170), bar_col)
+        draw_rail_chip(d, sel_y, "stop",   "停止", RED, bar_col)
+    elif state == "result":
+        draw_rail_chip(d, up_y,  "flip",   "反転", WHITE, bar_col)
+        draw_rail_chip(d, sel_y, "rec",    "録音", RED, bar_col)
     else:
-        # Japanese prompt: "日本語で話して下さい"
-        f_prompt = load_font(FONT_JP, 22)
-        lines = ["日本語で",
-                 "話して下さい"]
-        for i, line in enumerate(lines):
-            try:
-                bb = draw.textbbox((0,0), line, font=f_prompt)
-                tw = bb[2]-bb[0]
-            except Exception:
-                tw = 22 * len(line)
-            draw.text((lm + (pw-tw)//2, prompt_y + i*28), line,
-                      font=f_prompt, fill=WHITE)
+        draw_rail_chip(d, up_y,  "rotate", "切替", WHITE, bar_col)
+        draw_rail_chip(d, sel_y, "rec",    "録音", RED, bar_col)
+    draw_rail_chip(d, dn_y, "list", "履歴", WHITE, bar_col)
 
+
+# ── Screens ───────────────────────────────────────────────────────────────
+def make_home(mode_ejp, path):
+    bg      = BG_ENJP if mode_ejp else BG_JPEN
+    bar     = BAR_ENJP if mode_ejp else BAR_JPEN
+    badge   = "EN → JP" if mode_ejp else "JP → EN"
+    img = Image.new("RGB", (W, H), bg)
+    d   = ImageDraw.Draw(img)
+
+    draw_face(d, mode_ejp, bar)
+    _, _, _, bot = face_geometry(mode_ejp)
+
+    lines = ["Please speak", "in English"] if mode_ejp else ["日本語で", "話して下さい"]
+    f = load_font(FONT_SANS if mode_ejp else FONT_JP, 24)
+    y = bot + 6
+    for line in lines:
+        centre_text(d, line, f, 4, y, W - RAIL_W - 8, WHITE)
+        y += 30
+
+    draw_status_bar(d, badge, bar)
+    draw_rail(d, "home", bar)
     img.save(path)
     print(f"  Saved {path}")
 
-# ── Main ──────────────────────────────────────────────────────────────────
+
+def make_result(path, flipped=False):
+    bar = BAR_JPEN
+    img = Image.new("RGB", (W, H), BG_JPEN)
+    d   = ImageDraw.Draw(img)
+
+    cx, cy = 5, STATUS_H + 4
+    cw, ch = W - 5 - RAIL_W, H - cy - 6
+
+    card = Image.new("RGB", (cw, ch), WHITE)
+    cd   = ImageDraw.Draw(card)
+    msg  = "Nice to meet you."
+    f    = load_font(FONT_SANS, 28)
+    words, lines, cur = msg.split(), [], ""
+    for wd in words:
+        trial = (cur + " " + wd).strip()
+        if text_w(cd, trial, f) <= cw - 12:
+            cur = trial
+        else:
+            lines.append(cur); cur = wd
+    if cur:
+        lines.append(cur)
+    ty = (ch - len(lines) * 32) // 2
+    for line in lines:
+        centre_text(cd, line, f, 0, ty, cw, INK)
+        ty += 32
+    if flipped:
+        card = card.rotate(180)
+    mask = Image.new("L", (cw, ch), 0)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, cw - 1, ch - 1), radius=9, fill=255)
+    img.paste(card, (cx, cy), mask)
+
+    # Flip hint pill — drawn after the rotation so it always reads upright
+    pw, ph = 50, 18
+    px, py = cx + cw - pw - 6, cy + 6
+    d.rounded_rectangle((px, py, px + pw, py + ph), radius=5, fill=ACCENT)
+    draw_icon(d, "flip", px + 11, py + ph // 2, WHITE)
+    d.text((px + 20, py + 1), "反転", font=load_font(FONT_JP, 14), fill=WHITE)
+
+    draw_status_bar(d, "JP → EN", bar)
+    draw_rail(d, "result", bar)
+    img.save(path)
+    print(f"  Saved {path}")
+
+
+def make_listening(path):
+    bar = BAR_JPEN
+    img = Image.new("RGB", (W, H), BG_JPEN)
+    d   = ImageDraw.Draw(img)
+
+    cc     = (W - RAIL_W) // 2
+    mic_cy = STATUS_H + (H - STATUS_H) * 30 // 100
+    r      = 24
+    d.ellipse((cc - r, mic_cy - r, cc + r, mic_cy + r), outline=WHITE, width=3)
+    bw, bh = r * 4 // 9, r
+    d.rounded_rectangle((cc - bw // 2, mic_cy - bh * 3 // 5,
+                         cc + bw // 2, mic_cy - bh * 3 // 5 + bh),
+                        radius=bw // 2, fill=WHITE)
+    d.arc((cc - bw, mic_cy - bh // 4, cc + bw, mic_cy - bh // 4 + bh * 3 // 4 + 4),
+          start=0, end=180, fill=WHITE, width=2)
+    d.line((cc, mic_cy + bh // 2, cc, mic_cy + bh * 4 // 5), fill=WHITE, width=2)
+
+    centre_text(d, "聞き取り中…", load_font(FONT_JP, 24), 4, mic_cy + 34,
+                W - RAIL_W - 8, WHITE)
+
+    bars = [5, 9, 14, 18, 20, 18, 14, 9, 5, 4, 6, 10, 14]
+    x0, base = cc - (13 * 7 - 3) // 2, H - 18
+    for i, bh2 in enumerate(bars):
+        d.rounded_rectangle((x0 + i * 7, base - bh2, x0 + i * 7 + 4, base),
+                            radius=1, fill=WHITE)
+
+    draw_status_bar(d, "JP → EN", bar)
+    draw_rail(d, "listening", bar)
+    img.save(path)
+    print(f"  Saved {path}")
+
+
+def make_log(path):
+    bar = BAR_JPEN
+    img = Image.new("RGB", (W, H), BG_JPEN)
+    d   = ImageDraw.Draw(img)
+    draw_status_bar(d, "履歴", bar)
+
+    items  = [("08:12", "Nice to meet you."), ("08:05", "Where is the station?")]
+    lm     = 6
+    card_h = (H - STATUS_H - 18) // 2
+    y      = STATUS_H + 6
+    ft     = load_font(FONT_SANS, 18)
+    fb     = load_font(FONT_SANS, 18)
+    for ts, msg in items:
+        d.rounded_rectangle((lm, y, W - lm, y + card_h), radius=8, fill=WHITE)
+        d.text((lm + 8, y + 3), ts, font=ft, fill=ACCENT)
+        words, lines, cur = msg.split(), [], ""
+        for wd in words:
+            trial = (cur + " " + wd).strip()
+            if text_w(d, trial, fb) <= W - lm * 2 - 16:
+                cur = trial
+            else:
+                lines.append(cur); cur = wd
+        if cur:
+            lines.append(cur)
+        ty = y + 24
+        for line in lines:
+            d.text((lm + 8, ty), line, font=fb, fill=INK)
+            ty += 22
+        y += card_h + 6
+    img.save(path)
+    print(f"  Saved {path}")
+
+
+# ── Store icons ───────────────────────────────────────────────────────────
+def make_menu_image(path):
+    img = Image.new("RGB", (25, 25), WHITE)
+    d   = ImageDraw.Draw(img)
+    sn, sd = 18, 77
+    ox, oy = 12 - 64 * sn // sd, 11 - 60 * sn // sd
+    pts = [(SVG_FX[i] * sn // sd + ox, SVG_FY[i] * sn // sd + oy) for i in range(20)]
+    d.polygon(pts, fill=BLACK, outline=BLACK)
+    ex, ey = 62 * sn // sd + ox, 48 * sn // sd + oy
+    d.ellipse((ex - 1, ey - 1, ex + 1, ey + 1), fill=WHITE)
+    img.save(path)
+    print(f"  Saved {path}")
+
+
+def make_icon(size, path):
+    img = Image.new("RGB", (size, size), BG_JPEN)
+    d   = ImageDraw.Draw(img)
+    d.rounded_rectangle((0, 0, size - 1, size - 1), radius=size // 8, fill=BG_JPEN)
+    sn, sd = size * 72 // 100, 77
+    cx, cy = size // 2, size * 47 // 100
+    ox, oy = cx - 64 * sn // sd, cy - 60 * sn // sd
+    pts = [(SVG_FX[i] * sn // sd + ox, SVG_FY[i] * sn // sd + oy) for i in range(20)]
+    sw = max(1, size // 40)
+    for dx in range(-sw + 1, sw + 1):
+        for dy in range(-sw + 1, sw + 1):
+            d.polygon([(x + dx, y + dy) for x, y in pts], outline=YELLOW)
+    ex, ey, er = 62 * sn // sd + ox, 48 * sn // sd + oy, max(2, 4 * sn // sd)
+    d.ellipse((ex - er, ey - er, ex + er, ey + er), fill=YELLOW)
+    mx, my = 42 * sn // sd + ox, 78 * sn // sd + oy
+    ro, ri = max(4, 8 * sn // sd), max(2, 4 * sn // sd)
+    d.ellipse((mx - ro, my - ro, mx + ro, my + ro), fill=YELLOW)
+    d.ellipse((mx - ri, my - ri, mx + ri, my + ri), fill=BAR_JPEN)
+    f = load_font(FONT_SANS, max(8, size // 12))
+    centre_text(d, "J→E", f, 0, size - f.size - size // 14, size, WHITE)
+    img.save(path)
+    print(f"  Saved {path}")
+
+
 if __name__ == "__main__":
     os.makedirs("assets", exist_ok=True)
     print("Generating assets…")
     make_menu_image("assets/menu_image.png")
     make_icon(80,  "assets/icon_80.png")
     make_icon(144, "assets/icon_144.png")
-    make_screenshot(False, "assets/screenshot_jp_en.png")
-    make_screenshot(True,  "assets/screenshot_en_jp.png")
+    make_home(False, "assets/screenshot_jp_en.png")
+    make_home(True,  "assets/screenshot_en_jp.png")
+    make_listening("assets/screenshot_listening.png")
+    make_result("assets/screenshot_result.png")
+    make_log("assets/screenshot_log.png")
     print("Done.")
