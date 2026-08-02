@@ -344,6 +344,7 @@ if __name__ == "__main__":
     os.makedirs("assets", exist_ok=True)
     print("Generating assets…")
     make_menu_image("assets/menu_image.png")
+    make_icon(48,  "assets/icon_48.png")
     make_icon(80,  "assets/icon_80.png")
     make_icon(144, "assets/icon_144.png")
     make_home(False, "assets/screenshot_jp_en.png")
