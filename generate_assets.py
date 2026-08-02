@@ -296,26 +296,47 @@ def make_menu_image(path):
 
 
 def make_icon(size, path):
-    img = Image.new("RGB", (size, size), BG_JPEN)
+    """The home-screen face, scaled up to own the whole tile.
+
+    Rendered at 4x and downsampled so the profile keeps clean edges at 80 px.
+    No lettering: at this size type only crowds the face out.
+    """
+    S = 4                      # supersampling factor
+    px = size * S
+    img = Image.new("RGB", (px, px), BG_JPEN)
     d   = ImageDraw.Draw(img)
-    d.rounded_rectangle((0, 0, size - 1, size - 1), radius=size // 8, fill=BG_JPEN)
-    sn, sd = size * 72 // 100, 77
-    cx, cy = size // 2, size * 47 // 100
+
+    # Face fills 80% of the tile height and sits dead centre. The SVG's
+    # drawing box is x 32..97, y 22..99, so (64, 60) is its middle.
+    sn, sd = px * 80 // 100, 77
+    cx = cy = px // 2
     ox, oy = cx - 64 * sn // sd, cy - 60 * sn // sd
-    pts = [(SVG_FX[i] * sn // sd + ox, SVG_FY[i] * sn // sd + oy) for i in range(20)]
-    sw = max(1, size // 40)
-    for dx in range(-sw + 1, sw + 1):
-        for dy in range(-sw + 1, sw + 1):
+
+    def fx(v):
+        return v * sn // sd + ox
+
+    def fy(v):
+        return v * sn // sd + oy
+
+    pts = [(fx(SVG_FX[i]), fy(SVG_FY[i])) for i in range(20)]
+
+    # Slightly heavier than the watch draws it, but thin enough that the
+    # pointed snout and the open mouth stay as separate shapes.
+    sw = max(2, px // 40)
+    for dx in range(-sw, sw + 1):
+        for dy in range(-sw, sw + 1):
             d.polygon([(x + dx, y + dy) for x, y in pts], outline=YELLOW)
-    ex, ey, er = 62 * sn // sd + ox, 48 * sn // sd + oy, max(2, 4 * sn // sd)
+
+    er = max(2, 5 * sn // sd)
+    ex, ey = fx(62), fy(48)
     d.ellipse((ex - er, ey - er, ex + er, ey + er), fill=YELLOW)
-    mx, my = 42 * sn // sd + ox, 78 * sn // sd + oy
-    ro, ri = max(4, 8 * sn // sd), max(2, 4 * sn // sd)
+
+    mx, my = fx(42), fy(78)
+    ro, ri = max(4, 9 * sn // sd), max(2, 4 * sn // sd)
     d.ellipse((mx - ro, my - ro, mx + ro, my + ro), fill=YELLOW)
     d.ellipse((mx - ri, my - ri, mx + ri, my + ri), fill=BAR_JPEN)
-    f = load_font(FONT_SANS, max(8, size // 12))
-    centre_text(d, "J→E", f, 0, size - f.size - size // 14, size, WHITE)
-    img.save(path)
+
+    img.resize((size, size), Image.LANCZOS).save(path)
     print(f"  Saved {path}")
 
 
